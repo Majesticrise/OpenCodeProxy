@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zen Proxy Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="sidebar">
+        <div class="sidebar-top">
+            <h2>Zen Proxy</h2>
+            <p class="subtitle">Rust 驱动的高性能免密代理</p>
+
+            <div class="config-group">
+                <label>监听端口 (Listen Port):</label>
+                <input type="text" id="listenPort" value="8910" disabled>
+            </div>
+            <div class="config-group">
+                <label>转发上游 (Upstream Base URL):</label>
+                <input type="text" id="upstreamUrl" value="https://opencode.ai/zen/v1" disabled>
+            </div>
+
+            <button id="toggleBtn" class="btn-stop" onclick="toggleService()">停止代理服务</button>
+        </div>
+
+        <div class="sidebar-bottom">
+            <p class="title">客户端集成说明：</p>
+            <p>1. 将客户端 API Base URL 替换为：</p>
+            <code id="apiBase">http://localhost:8910/v1</code>
+            <p>2. 授权密钥 (API Key) 任意填写即可；</p>
+            <p>3. 模型名填写 <code>deepseek-v4-flash-free</code> 等。</p>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <h3>📊 运行实时监视</h3>
+        
+        <div class="status-bar">
+            <div class="status-item" id="statusText">服务状态 <span class="green">● 运行中</span></div>
+            <div class="status-item" id="poolText">活动代理池 0 个节点</div>
+            <div class="status-item" id="reqText">已处理请求 0</div>
+            <div class="status-item" id="latencyText">平均延迟 -</div>
+        </div>
+
+        <div class="log-header">
+            <span>📋 服务日志</span>
+            <div>
+                <label><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+                <button onclick="clearLogs()">🗑 清空日志</button>
+            </div>
+        </div>
+        <div class="log-box" id="logBox"></div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
