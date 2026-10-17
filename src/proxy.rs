@@ -13,8 +13,65 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+/// 429 限流后的短冷却
+const COOLDOWN_RATE_LIMIT: Duration = Duration::from_secs(30);
+/// 连接错误 / 超时后的长冷却
+const COOLDOWN_CONNECTION: Duration = Duration::from_secs(300);
+/// 连续失败达到该次数后真正移除
+const MAX_FAILS_BEFORE_REMOVE: u32 = 3;
+
+// ───────────────────────── 代理条目 ─────────────────────────
+
+#[derive(Clone)]
+pub struct ProxyEntry {
+    pub url: String,
+    pub latency: f64,
+    /// 处于冷却期时 now < cooldown_until 视为不可用
+    pub cooldown_until: Option<Instant>,
+    /// 连续失败次数
+    pub fail_count: u32,
+    /// 最近一次成功时间（诊断用）
+    pub last_success: Option<Instant>,
+}
+
+impl ProxyEntry {
+    fn new(url: String, latency: f64) -> Self {
+        Self {
+            url,
+            latency,
+            cooldown_until: None,
+            fail_count: 0,
+            last_success: None,
+        }
+    }
+
+    pub fn available(&self, now: Instant) -> bool {
+        self.cooldown_until.map_or(true, |t| now >= t)
+    }
+}
+
+/// 失败分类，决定冷却时长
+#[derive(Clone, Copy)]
+pub enum FailureKind {
+    /// HTTP 429，短冷却
+    RateLimit,
+    /// 连接错误 / 超时 / 5xx，长冷却
+    Connection,
+}
+
+impl FailureKind {
+    fn cooldown(self) -> Duration {
+        match self {
+            FailureKind::RateLimit => COOLDOWN_RATE_LIMIT,
+            FailureKind::Connection => COOLDOWN_CONNECTION,
+        }
+    }
+}
+
+// ───────────────────────── 池内部与句柄 ─────────────────────────
+
 pub struct ProxyPoolInner {
-    pub proxies: Vec<(String, f64)>,
+    pub proxies: Vec<ProxyEntry>,
     pub file_path: String,
     pub is_running: AtomicBool,
     pub total_requests: AtomicU64,
@@ -34,6 +91,8 @@ impl Drop for FetchingReset {
         self.0.store(false, Ordering::Release);
     }
 }
+
+// ───────────────────────── 实现 ─────────────────────────
 
 impl ProxyPool {
     pub fn new(file_path: &str) -> Self {
@@ -68,31 +127,29 @@ impl ProxyPool {
                     } else {
                         line.to_string()
                     };
-                    file_proxies.push((proxy_url, 0.0));
+                    file_proxies.push(ProxyEntry::new(proxy_url, 0.0));
                 }
                 if !file_proxies.is_empty() {
                     let mut inner = self.inner.write().await;
+                    let n = file_proxies.len();
                     inner.proxies = file_proxies;
-                    info!(
-                        "Loaded {} proxies from local file {}",
-                        inner.proxies.len(),
-                        file_path
-                    );
+                    info!("Loaded {} proxies from local file {}", n, file_path);
                     return;
                 }
             }
         }
 
-        // 2. 其次读取持久化的 verified_proxies.json
+        // 2. 其次读取持久化的 verified_proxies.json（格式仍是 [(url, latency)])
         if let Ok(content) = tokio::fs::read_to_string("verified_proxies.json").await {
             if let Ok(validated) = serde_json::from_str::<Vec<(String, f64)>>(&content) {
                 if !validated.is_empty() {
                     let mut inner = self.inner.write().await;
-                    inner.proxies = validated;
-                    info!(
-                        "Loaded {} proxies from verified_proxies.json",
-                        inner.proxies.len()
-                    );
+                    let n = validated.len();
+                    inner.proxies = validated
+                        .into_iter()
+                        .map(|(url, lat)| ProxyEntry::new(url, lat))
+                        .collect();
+                    info!("Loaded {} proxies from verified_proxies.json", n);
                     return;
                 }
             }
@@ -214,50 +271,118 @@ impl ProxyPool {
         validated.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         validated.truncate(100);
 
-        let mut inner = self.inner.write().await;
-        inner.proxies = validated.clone();
-
         if !validated.is_empty() {
             info!(
                 "Proxy pool updated: {} high-speed verified proxies ready. (Fastest: {:.2}s)",
                 validated.len(),
                 validated[0].1
             );
-            // 持久化
-            let json_str = serde_json::to_string_pretty(&validated).unwrap_or_default();
-            if let Err(e) = tokio::fs::write("verified_proxies.json", json_str).await {
-                warn!("Failed to persist proxy pool: {}", e);
-            } else {
-                info!("Proxy pool persisted to verified_proxies.json");
+
+            // 持久化：仍用 [(url, latency)] 元组格式，保持向后兼容
+            let to_save: Vec<(String, f64)> =
+                validated.iter().map(|(u, l)| (u.clone(), *l)).collect();
+            match serde_json::to_string_pretty(&to_save) {
+                Ok(json_str) => {
+                    if let Err(e) = tokio::fs::write("verified_proxies.json", json_str).await {
+                        warn!("Failed to persist proxy pool: {}", e);
+                    } else {
+                        info!("Proxy pool persisted to verified_proxies.json");
+                    }
+                }
+                Err(e) => warn!("Failed to serialize proxy pool: {}", e),
             }
+
+            // 覆盖内存池（重置所有冷却 / 失败计数）
+            let mut inner = self.inner.write().await;
+            inner.proxies = validated
+                .into_iter()
+                .map(|(url, lat)| ProxyEntry::new(url, lat))
+                .collect();
         } else {
             warn!("No proxies passed the high-speed check (under 5s). Pool empty.");
+            let mut inner = self.inner.write().await;
+            inner.proxies.clear();
         }
     }
 
+    /// 随机取一个未处于冷却期的代理（偏向前 15 个低延迟者）
     pub async fn get_proxy(&self) -> Option<String> {
         let inner = self.inner.read().await;
-        if inner.proxies.is_empty() {
+        let now = Instant::now();
+
+        let available: Vec<&ProxyEntry> = inner
+            .proxies
+            .iter()
+            .filter(|p| p.available(now))
+            .collect();
+
+        if available.is_empty() {
             return None;
         }
-        let limit = std::cmp::min(15, inner.proxies.len());
-        let slice = &inner.proxies[..limit];
-        slice.choose(&mut rand::thread_rng()).map(|x| x.0.clone())
+
+        let limit = std::cmp::min(15, available.len());
+        let slice = &available[..limit];
+        slice.choose(&mut rand::thread_rng()).map(|x| x.url.clone())
     }
 
+    /// 连接失败 / 超时 / 5xx：长冷却，连续失败达阈值后移除
     pub async fn report_failure(&self, proxy_url: &str) {
+        self.report_failure_kind(proxy_url, FailureKind::Connection).await;
+    }
+
+    /// HTTP 429：短冷却，不立即移除
+    pub async fn report_rate_limit(&self, proxy_url: &str) {
+        self.report_failure_kind(proxy_url, FailureKind::RateLimit).await;
+    }
+
+    /// 请求成功：清零失败计数与冷却
+    pub async fn report_success(&self, proxy_url: &str) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
+            entry.fail_count = 0;
+            entry.cooldown_until = None;
+            entry.last_success = Some(Instant::now());
+        }
+    }
+
+    async fn report_failure_kind(&self, proxy_url: &str, kind: FailureKind) {
+        let cooldown = kind.cooldown();
         let (after_len, fetching) = {
             let mut inner = self.inner.write().await;
-            let before_len = inner.proxies.len();
-            inner.proxies.retain(|x| x.0 != proxy_url);
-            let after_len = inner.proxies.len();
-            if before_len != after_len {
+            let now = Instant::now();
+
+            let mut should_remove = false;
+            if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
+                entry.fail_count += 1;
+                entry.cooldown_until = Some(now + cooldown);
+                should_remove = entry.fail_count >= MAX_FAILS_BEFORE_REMOVE;
+            }
+
+            if should_remove {
+                let before = inner.proxies.len();
+                inner.proxies.retain(|p| p.url != proxy_url);
                 warn!(
-                    "Removed failed proxy: {}. Active pool size: {}",
-                    proxy_url, after_len
+                    "Removed repeatedly-failing proxy: {}. Pool size: {} -> {}",
+                    proxy_url,
+                    before,
+                    inner.proxies.len()
+                );
+            } else {
+                warn!(
+                    "Proxy {} marked as {:?}, cooldown {:?}",
+                    proxy_url,
+                    match kind {
+                        FailureKind::RateLimit => "rate-limited",
+                        FailureKind::Connection => "connection-error",
+                    },
+                    cooldown
                 );
             }
-            (after_len, self.is_fetching.load(Ordering::Relaxed))
+
+            (
+                inner.proxies.len(),
+                self.is_fetching.load(Ordering::Relaxed),
+            )
         };
 
         if after_len < *MIN_POOL_SIZE && !fetching {

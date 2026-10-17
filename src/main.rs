@@ -5,6 +5,7 @@ mod metrics;
 mod middleware;
 mod proxy;
 mod state;
+use dashmap::DashMap;
 
 use crate::{
     logger::{LogBuffer, LogLayer},
@@ -61,6 +62,7 @@ async fn main() {
         pool: proxy_pool,
         log_buffer: log_buffer.clone(),
         metrics: Arc::new(MetricsStore::new()),
+        client_cache: Arc::new(DashMap::new()),
     };
 
     let app = Router::new()
