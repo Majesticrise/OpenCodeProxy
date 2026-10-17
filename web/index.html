@@ -7,50 +7,161 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="sidebar">
-        <div class="sidebar-top">
-            <h2>Zen Proxy</h2>
-            <p class="subtitle">Rust 驱动的高性能免密代理</p>
-
-            <div class="config-group">
-                <label>监听端口 (Listen Port):</label>
-                <input type="text" id="listenPort" value="8910" disabled>
-            </div>
-            <div class="config-group">
-                <label>转发上游 (Upstream Base URL):</label>
-                <input type="text" id="upstreamUrl" value="https://opencode.ai/zen/v1" disabled>
+    <div class="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-logo">Z</div>
+                <div class="brand-text">
+                    <div class="brand-title">Zen Proxy</div>
+                    <div class="brand-sub">Rust 高性能免密代理</div>
+                </div>
             </div>
 
-            <button id="toggleBtn" class="btn-stop" onclick="toggleService()">停止代理服务</button>
-        </div>
+            <nav class="nav">
+                <a class="nav-item active" data-view="dashboard"><span>📊</span>总览</a>
+                <a class="nav-item" data-view="logs"><span>📋</span>实时日志</a>
+                <a class="nav-item" data-view="playground"><span>🧪</span>Playground</a>
+                <a class="nav-item" data-view="config"><span>⚙️</span>配置</a>
+            </nav>
 
-        <div class="sidebar-bottom">
-            <p class="title">客户端集成说明：</p>
-            <p>1. 将客户端 API Base URL 替换为：</p>
-            <code id="apiBase">http://localhost:8910/v1</code>
-            <p>2. 授权密钥 (API Key) 任意填写即可；</p>
-            <p>3. 模型名填写 <code>deepseek-v4-flash-free</code> 等。</p>
-        </div>
-    </div>
-
-    <div class="main-content">
-        <h3>📊 运行实时监视</h3>
-        
-        <div class="status-bar">
-            <div class="status-item" id="statusText">服务状态 <span class="green">● 运行中</span></div>
-            <div class="status-item" id="poolText">活动代理池 0 个节点</div>
-            <div class="status-item" id="reqText">已处理请求 0</div>
-            <div class="status-item" id="latencyText">平均延迟 -</div>
-        </div>
-
-        <div class="log-header">
-            <span>📋 服务日志</span>
-            <div>
-                <label><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
-                <button onclick="clearLogs()">🗑 清空日志</button>
+            <div class="sidebar-footer">
+                <button id="toggleBtn" class="btn btn-danger">停止服务</button>
             </div>
-        </div>
-        <div class="log-box" id="logBox"></div>
+        </aside>
+
+        <!-- 主内容 -->
+        <main class="main">
+            <header class="topbar">
+                <div class="topbar-left">
+                    <span class="dot" id="statusDot"></span>
+                    <span id="statusLabel">连接中…</span>
+                </div>
+                <div class="topbar-right">
+                    <span class="meta" id="metaPort">:8910</span>
+                    <span class="meta" id="metaUpstream">opencode.ai/zen/v1</span>
+                </div>
+            </header>
+
+            <div class="content">
+                <!-- 仪表盘 -->
+                <section class="view active" id="view-dashboard">
+                    <div class="grid grid-4">
+                        <div class="card metric">
+                            <div class="metric-label">总请求数</div>
+                            <div class="metric-value" id="m-total">0</div>
+                        </div>
+                        <div class="card metric">
+                            <div class="metric-label">成功率</div>
+                            <div class="metric-value" id="m-success">0%</div>
+                        </div>
+                        <div class="card metric">
+                            <div class="metric-label">P95 延迟</div>
+                            <div class="metric-value" id="m-p95">0<small>ms</small></div>
+                        </div>
+                        <div class="card metric">
+                            <div class="metric-label">活跃请求</div>
+                            <div class="metric-value" id="m-active">0</div>
+                            <div class="metric-sub" id="m-active-streams">流式 0</div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-2">
+                        <div class="card">
+                            <div class="card-title">Token 使用</div>
+                            <div class="kv"><span>总量</span><span id="t-total">0</span></div>
+                            <div class="kv"><span>缓存命中</span><span id="t-cached">0</span></div>
+                            <div class="kv"><span>推理</span><span id="t-reasoning">0</span></div>
+                            <div class="kv"><span>使用覆盖率</span><span id="t-coverage">0%</span></div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title">代理池</div>
+                            <div class="kv"><span>节点数</span><span id="p-size">0</span></div>
+                            <div class="kv"><span>平均延迟</span><span id="p-latency">-</span></div>
+                            <div class="kv"><span>状态</span><span id="p-state">-</span></div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title">每分钟 Token 使用</div>
+                        <canvas id="chartPerMinute" height="180"></canvas>
+                    </div>
+
+                    <div class="grid grid-2">
+                        <div class="card">
+                            <div class="card-title">按模型统计 <span class="muted">(prompt / completion / total)</span></div>
+                            <div id="modelList" class="list"><div class="empty">暂无数据</div></div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title">HTTP 状态分布</div>
+                            <div id="statusList" class="list"><div class="empty">暂无数据</div></div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 日志 -->
+                <section class="view" id="view-logs">
+                    <div class="log-toolbar">
+                        <div class="chip-group" id="levelFilter">
+                            <button class="chip active" data-level="all">全部</button>
+                            <button class="chip" data-level="INFO">INFO</button>
+                            <button class="chip" data-level="WARN">WARN</button>
+                            <button class="chip" data-level="ERROR">ERROR</button>
+                            <button class="chip" data-level="DEBUG">DEBUG</button>
+                        </div>
+                        <input id="logSearch" class="search" type="text" placeholder="搜索日志…" />
+                        <label class="checkbox"><input type="checkbox" id="logPause" /> 暂停</label>
+                        <label class="checkbox"><input type="checkbox" id="logAutoScroll" checked /> 自动滚动</label>
+                        <button class="btn btn-ghost btn-sm" id="logClear">清空显示</button>
+                        <span class="muted" id="logCount">0 条</span>
+                    </div>
+                    <div class="log-box" id="logBox"></div>
+                </section>
+
+                <!-- Playground -->
+                <section class="view" id="view-playground">
+                    <div class="card">
+                        <div class="pg-row">
+                            <label class="field">
+                                <span>模型</span>
+                                <select id="pgModel"></select>
+                            </label>
+                            <label class="checkbox"><input type="checkbox" id="pgStream" checked /> 流式响应</label>
+                            <div class="spacer"></div>
+                            <button class="btn btn-primary" id="pgSend">发送</button>
+                            <button class="btn btn-ghost" id="pgClear">清空</button>
+                        </div>
+                        <textarea id="pgInput" class="pg-input" placeholder="输入你的问题…"></textarea>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title">响应</div>
+                        <pre class="response" id="pgResponse"></pre>
+                    </div>
+                </section>
+
+                <!-- 配置 -->
+                <section class="view" id="view-config">
+                    <div class="card">
+                        <div class="card-title">运行配置</div>
+                        <p class="muted">当前配置通过环境变量注入，页面只读。</p>
+                        <div class="kv"><span>监听端口</span><code>8910</code></div>
+                        <div class="kv"><span>上游地址</span><code>https://opencode.ai/zen/v1</code></div>
+                        <div class="kv"><span>代理文件</span><code>proxies.txt</code></div>
+                        <div class="kv"><span>日志级别</span><code>info</code></div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title">客户端接入</div>
+                        <ol class="steps">
+                            <li>Base URL 替换为 <code>http://localhost:8910/v1</code></li>
+                            <li>API Key 任意填写即可</li>
+                            <li>模型名填 <code>deepseek-v4-flash-free</code> 等</li>
+                        </ol>
+                    </div>
+                </section>
+            </div>
+        </main>
     </div>
 
     <script src="/static/app.js"></script>
