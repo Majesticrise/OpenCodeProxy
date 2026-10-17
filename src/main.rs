@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Extension, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -36,6 +36,13 @@ lazy_static::lazy_static! {
     static ref PROXY_FILE: String = env::var("PROXY_FILE").unwrap_or_else(|_| "proxies.txt".to_string());
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ModelInfo {
+    id: String,
+    name: String,
+    owned_by: String,
+}
+
 // ── 日志缓冲区 ────────────────────────────────────────────────────────
 struct LogBuffer {
     logs: Mutex<VecDeque<String>>,
@@ -47,7 +54,9 @@ impl LogBuffer {
     }
     fn push(&self, msg: String) {
         let mut logs = self.logs.lock().unwrap();
-        if logs.len() >= 500 { logs.pop_front(); }
+        if logs.len() >= 500 {
+            logs.pop_front();
+        }
         logs.push_back(msg);
     }
     fn get_all(&self) -> Vec<String> {
@@ -55,12 +64,21 @@ impl LogBuffer {
     }
 }
 
-struct WebLogWriter { buffer: Arc<LogBuffer> }
+struct WebLogWriter {
+    buffer: Arc<LogBuffer>,
+}
+
 impl<'a> MakeWriter<'a> for WebLogWriter {
     type Writer = WebLogWriterGuard;
-    fn make_writer(&'a self) -> Self::Writer { WebLogWriterGuard { buffer: self.buffer.clone() } }
+    fn make_writer(&'a self) -> Self::Writer {
+        WebLogWriterGuard { buffer: self.buffer.clone() }
+    }
 }
-struct WebLogWriterGuard { buffer: Arc<LogBuffer> }
+
+struct WebLogWriterGuard {
+    buffer: Arc<LogBuffer>,
+}
+
 impl Write for WebLogWriterGuard {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let msg = String::from_utf8_lossy(buf).trim_end().to_string();
@@ -70,7 +88,9 @@ impl Write for WebLogWriterGuard {
         }
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // ── 代理池实现 ────────────────────────────────────────────────────────
@@ -108,10 +128,17 @@ impl ProxyPool {
                     let mut file_proxies = Vec::new();
                     for line in content.lines() {
                         let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') { continue; }
-                        let proxy_url = if !(line.starts_with("http://") || line.starts_with("https://") || line.starts_with("socks5://")) {
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        let proxy_url = if !(line.starts_with("http://")
+                            || line.starts_with("https://")
+                            || line.starts_with("socks5://"))
+                        {
                             format!("http://{}", line)
-                        } else { line.to_string() };
+                        } else {
+                            line.to_string()
+                        };
                         file_proxies.push((proxy_url, 0.0));
                     }
                     if !file_proxies.is_empty() {
@@ -128,7 +155,9 @@ impl ProxyPool {
     }
 
     async fn fetch_free_proxies(&self) {
-        if self.inner.read().await.is_fetching { return; }
+        if self.inner.read().await.is_fetching {
+            return;
+        }
         self.inner.write().await.is_fetching = true;
 
         let self_clone = self.clone();
@@ -141,7 +170,10 @@ impl ProxyPool {
             ];
 
             let mut raw_ips = HashSet::new();
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(8)).build().unwrap();
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .build()
+                .unwrap();
 
             for url in sources {
                 match client.get(url).send().await {
@@ -150,7 +182,9 @@ impl ProxyPool {
                             if let Ok(text) = resp.text().await {
                                 for line in text.lines() {
                                     let line = line.trim();
-                                    if !line.is_empty() { raw_ips.insert(line.to_string()); }
+                                    if !line.is_empty() {
+                                        raw_ips.insert(line.to_string());
+                                    }
                                 }
                             }
                         }
@@ -165,8 +199,14 @@ impl ProxyPool {
                 return;
             }
 
-            let raw_proxies: Vec<String> = raw_ips.into_iter().map(|ip| format!("http://{}", ip)).collect();
-            info!("Fetched {} unique raw proxies. Starting background validation...", raw_proxies.len());
+            let raw_proxies: Vec<String> = raw_ips
+                .into_iter()
+                .map(|ip| format!("http://{}", ip))
+                .collect();
+            info!(
+                "Fetched {} unique raw proxies. Starting background validation...",
+                raw_proxies.len()
+            );
             self_clone.validate_proxies(raw_proxies).await;
         });
     }
@@ -188,7 +228,8 @@ impl ProxyPool {
                 let client = reqwest::Client::builder()
                     .proxy(reqwest::Proxy::all(&proxy).ok()?)
                     .timeout(Duration::from_millis(2500))
-                    .build().ok()?;
+                    .build()
+                    .ok()?;
                 match client.get("https://opencode.ai").send().await {
                     Ok(resp) if resp.status() == 200 => {
                         let elapsed = start.elapsed().as_secs_f64();
@@ -201,7 +242,9 @@ impl ProxyPool {
 
         let mut validated = Vec::new();
         for task in tasks {
-            if let Ok(Some((proxy, elapsed))) = task.await { validated.push((proxy, elapsed)); }
+            if let Ok(Some((proxy, elapsed))) = task.await {
+                validated.push((proxy, elapsed));
+            }
         }
         validated.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         validated.truncate(40);
@@ -211,7 +254,11 @@ impl ProxyPool {
         inner.is_fetching = false;
 
         if !validated.is_empty() {
-            info!("Proxy pool updated: {} high-speed verified proxies ready. (Fastest: {:.2}s)", validated.len(), validated[0].1);
+            info!(
+                "Proxy pool updated: {} high-speed verified proxies ready. (Fastest: {:.2}s)",
+                validated.len(),
+                validated[0].1
+            );
         } else {
             warn!("No proxies passed the high-speed check (under 2.5s). Pool empty.");
         }
@@ -219,7 +266,9 @@ impl ProxyPool {
 
     async fn get_proxy(&self) -> Option<String> {
         let inner = self.inner.read().await;
-        if inner.proxies.is_empty() { return None; }
+        if inner.proxies.is_empty() {
+            return None;
+        }
         let limit = std::cmp::min(15, inner.proxies.len());
         let slice = &inner.proxies[..limit];
         slice.choose(&mut rand::thread_rng()).map(|x| x.0.clone())
@@ -231,11 +280,16 @@ impl ProxyPool {
         inner.proxies.retain(|x| x.0 != proxy_url);
         let after_len = inner.proxies.len();
         if before_len != after_len {
-            warn!("Removed failed proxy: {}. Active pool size: {}", proxy_url, after_len);
+            warn!(
+                "Removed failed proxy: {}. Active pool size: {}",
+                proxy_url, after_len
+            );
         }
         if after_len < 10 && !inner.is_fetching {
             let self_clone = self.clone();
-            tokio::spawn(async move { self_clone.fetch_free_proxies().await; });
+            tokio::spawn(async move {
+                self_clone.fetch_free_proxies().await;
+            });
         }
     }
 }
@@ -248,17 +302,29 @@ async fn root() -> impl IntoResponse {
 async fn static_handler(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches("/static/");
     match path {
-        "style.css" => ([(axum::http::header::CONTENT_TYPE, "text/css")], include_str!("web/style.css")).into_response(),
-        "app.js" => ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("web/app.js")).into_response(),
+        "style.css" => (
+            [(axum::http::header::CONTENT_TYPE, "text/css")],
+            include_str!("web/style.css"),
+        )
+            .into_response(),
+        "app.js" => (
+            [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+            include_str!("web/app.js"),
+        )
+            .into_response(),
         _ => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
 }
 
-async fn api_status(State(pool): State<ProxyPool>, State(log_buf): State<Arc<LogBuffer>>) -> impl IntoResponse {
+async fn api_status(State(pool): State<ProxyPool>) -> impl IntoResponse {
     let inner = pool.inner.read().await;
     let pool_size = inner.proxies.len();
     let running = inner.is_running.load(Ordering::Relaxed);
-    let avg_latency = if pool_size > 0 { inner.proxies.iter().map(|p| p.1).sum::<f64>() / pool_size as f64 } else { 0.0 };
+    let avg_latency = if pool_size > 0 {
+        inner.proxies.iter().map(|p| p.1).sum::<f64>() / pool_size as f64
+    } else {
+        0.0
+    };
     Json(json!({
         "running": running,
         "pool_size": pool_size,
@@ -268,7 +334,7 @@ async fn api_status(State(pool): State<ProxyPool>, State(log_buf): State<Arc<Log
     }))
 }
 
-async fn api_logs(State(log_buf): State<Arc<LogBuffer>>) -> impl IntoResponse {
+async fn api_logs(Extension(log_buf): Extension<Arc<LogBuffer>>) -> impl IntoResponse {
     Json(json!(log_buf.get_all()))
 }
 
@@ -276,7 +342,10 @@ async fn api_toggle(State(pool): State<ProxyPool>) -> impl IntoResponse {
     let inner = pool.inner.read().await;
     let current = inner.is_running.load(Ordering::Relaxed);
     inner.is_running.store(!current, Ordering::Relaxed);
-    info!("Proxy service toggled: {}", if !current { "RUNNING" } else { "STOPPED" });
+    info!(
+        "Proxy service toggled: {}",
+        if !current { "RUNNING" } else { "STOPPED" }
+    );
     Json(json!({ "running": !current }))
 }
 
@@ -293,7 +362,10 @@ async fn list_models() -> impl IntoResponse {
         json!({"id": "nemotron-3-super-free", "object": "model", "owned_by": "nvidia"}),
         json!({"id": "minimax-m3-free", "object": "model", "owned_by": "minimax"}),
     ];
-    Json(json!({ "object": "list", "data": models }))
+    Json(json!({
+        "object": "list",
+        "data": models
+    }))
 }
 
 // ── 核心转发逻辑 ──────────────────────────────────────────────────────
@@ -301,24 +373,42 @@ async fn chat_completions(
     State(pool): State<ProxyPool>,
     body_bytes: bytes::Bytes,
 ) -> impl IntoResponse {
-    // 检查服务是否被手动停止
     if !pool.inner.read().await.is_running.load(Ordering::Relaxed) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Proxy service is stopped by user.").into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, "Proxy service is stopped by user.")
+            .into_response();
     }
 
     let body_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(json) => json,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response()
+        }
     };
 
-    let model = body_json.get("model").and_then(|m| m.as_str()).unwrap_or("deepseek-v4-flash-free");
-    let is_stream = body_json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    info!("→ {} model={} messages", if is_stream { "STREAM" } else { "SYNC  " }, model);
+    let model = body_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("deepseek-v4-flash-free");
+    let is_stream = body_json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    info!(
+        "→ {} model={} messages",
+        if is_stream { "STREAM" } else { "SYNC  " },
+        model
+    );
 
-    pool.inner.read().await.total_requests.fetch_add(1, Ordering::Relaxed);
+    pool.inner
+        .read()
+        .await
+        .total_requests
+        .fetch_add(1, Ordering::Relaxed);
 
     let mut forward_body = body_json.clone();
-    if let Some(obj) = forward_body.as_object_mut() { obj.remove("variant"); }
+    if let Some(obj) = forward_body.as_object_mut() {
+        obj.remove("variant");
+    }
 
     let max_retries = 5;
     let mut target_resp: Option<reqwest::Response> = None;
@@ -327,31 +417,54 @@ async fn chat_completions(
     for attempt in 0..max_retries {
         let proxy = pool.get_proxy().await;
         last_proxy = proxy.clone();
-        info!("Chat Completion attempt {}/{} using proxy: {:?}", attempt + 1, max_retries, proxy);
+        info!(
+            "Chat Completion attempt {}/{} using proxy: {:?}",
+            attempt + 1,
+            max_retries,
+            proxy
+        );
 
         let mut client_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_millis(2500));
         if let Some(ref p) = proxy {
-            if let Ok(rp) = reqwest::Proxy::all(p) { client_builder = client_builder.proxy(rp); }
+            if let Ok(rp) = reqwest::Proxy::all(p) {
+                client_builder = client_builder.proxy(rp);
+            }
         }
 
         let client = match client_builder.build() {
             Ok(c) => c,
-            Err(e) => { error!("Failed to build reqwest client: {}", e); continue; }
+            Err(e) => {
+                error!("Failed to build reqwest client: {}", e);
+                continue;
+            }
         };
 
         let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
-        match client.post(&target_url).header("Content-Type", "application/json").json(&forward_body).send().await {
+        match client
+            .post(&target_url)
+            .header("Content-Type", "application/json")
+            .json(&forward_body)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().as_u16() == 429 => {
                 warn!("Proxy {:?} hit 429. Retrying...", proxy);
-                if let Some(ref p) = proxy { pool.report_failure(p).await; }
+                if let Some(ref p) = proxy {
+                    pool.report_failure(p).await;
+                }
                 continue;
             }
-            Ok(resp) => { target_resp = Some(resp); break; }
+            Ok(resp) => {
+                target_resp = Some(resp);
+                break;
+            }
             Err(e) => {
                 warn!("Proxy {:?} connection failed: {}. Retrying...", proxy, e);
-                if let Some(ref p) = proxy { pool.report_failure(p).await; }
+                if let Some(ref p) = proxy {
+                    pool.report_failure(p).await;
+                }
                 continue;
             }
         }
@@ -361,14 +474,37 @@ async fn chat_completions(
         Some(r) => r,
         None => {
             warn!("All proxies failed. Falling back to direct connection.");
-            let client = match reqwest::Client::builder().connect_timeout(Duration::from_millis(4000)).timeout(Duration::from_secs(300)).build() {
+            let client = match reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(4000))
+                .timeout(Duration::from_secs(300))
+                .build()
+            {
                 Ok(c) => c,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create client: {}", e)).into_response(),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to create client: {}", e),
+                    )
+                        .into_response()
+                }
             };
+
             let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
-            match client.post(&target_url).header("Content-Type", "application/json").json(&forward_body).send().await {
+            match client
+                .post(&target_url)
+                .header("Content-Type", "application/json")
+                .json(&forward_body)
+                .send()
+                .await
+            {
                 Ok(r) => r,
-                Err(e) => return (StatusCode::BAD_GATEWAY, format!("Upstream direct connection failed: {}", e)).into_response(),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Upstream direct connection failed: {}", e),
+                    )
+                        .into_response()
+                }
             }
         }
     };
@@ -377,16 +513,22 @@ async fn chat_completions(
     let mut headers = HeaderMap::new();
     for (key, value) in resp.headers().iter() {
         let name = key.as_str().to_lowercase();
-        if name == "content-encoding" || name == "content-length" || name == "transfer-encoding" { continue; }
+        if name == "content-encoding" || name == "content-length" || name == "transfer-encoding" {
+            continue;
+        }
         if let Ok(val) = HeaderValue::from_bytes(value.as_bytes()) {
-            if let Ok(header_name) = axum::http::header::HeaderName::from_bytes(key.as_str().as_bytes()) {
+            if let Ok(header_name) =
+                axum::http::header::HeaderName::from_bytes(key.as_str().as_bytes())
+            {
                 headers.insert(header_name, val);
             }
         }
     }
 
     info!("  ← status={} (routed via: {:?})", status, last_proxy);
-    let stream = resp.bytes_stream().map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let stream = resp
+        .bytes_stream()
+        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -403,11 +545,13 @@ async fn strip_auth_middleware(mut request: Request, next: Next) -> Result<Respo
 async fn main() {
     let log_buffer = Arc::new(LogBuffer::new());
     let filter = env::var("RUST_LOG").unwrap_or_else(|_| LOG_LEVEL.to_string());
-    
+
     // 初始化 tracing，将日志同时输出到终端和 Web 端
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_writer(WebLogWriter { buffer: log_buffer.clone() })
+        .with_writer(WebLogWriter {
+            buffer: log_buffer.clone(),
+        })
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
@@ -417,7 +561,9 @@ async fn main() {
 
     let proxy_pool = ProxyPool::new(&PROXY_FILE);
     let pool_clone = proxy_pool.clone();
-    tokio::spawn(async move { pool_clone.load_proxies().await; });
+    tokio::spawn(async move {
+        pool_clone.load_proxies().await;
+    });
 
     let pool_refresh = proxy_pool.clone();
     tokio::spawn(async move {
@@ -442,8 +588,8 @@ async fn main() {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(middleware::from_fn(strip_auth_middleware))
-        .with_state(proxy_pool)
-        .with_state(log_buffer);
+        .with_state(proxy_pool) // 状态1：代理池 (State)
+        .layer(axum::Extension(log_buffer)); // 状态2：日志缓冲区 (Extension)
 
     let addr = format!("{}:{}", *LISTEN_HOST, *LISTEN_PORT);
     info!("Listen:    http://{}", addr);
