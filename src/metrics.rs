@@ -7,6 +7,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tracing::debug;
 
 const WINDOW_SECS: u64 = 3600; // 60 分钟滑动窗口
 const MAX_SAMPLES: usize = 5000; // 最多保留 5000 条样本
@@ -60,6 +61,24 @@ pub struct TrackerState {
     pub is_stream: bool,
     pub status: u16,
     pub usage: Mutex<Option<UsageInfo>>,
+    /// 上游未返回 usage 时的 fallback：prompt 侧估算
+    pub estimated_prompt_tokens: u64,
+    /// 上游未返回 usage 时的 fallback：流式累加的 completion 字符数
+    pub streamed_chars: AtomicU64,
+}
+
+impl TrackerState {
+    pub fn new(start: Instant, model: String, is_stream: bool, status: u16) -> Self {
+        Self {
+            start,
+            model,
+            is_stream,
+            status,
+            usage: Mutex::new(None),
+            estimated_prompt_tokens: 0,
+            streamed_chars: AtomicU64::new(0),
+        }
+    }
 }
 
 struct SnapshotCache {
@@ -250,11 +269,11 @@ pub fn now_secs() -> u64 {
 
 /// 从响应 chunk（原始字节）里提取 usage。
 ///
-/// 关键点：
-/// 1. 按 **字节** 累积，遇到 `\n`（UTF-8 中 0x0A 不会出现在多字节序列内部）
-///    才切行，避免 chunk 边界落在多字节字符中间导致 from_utf8 失败而丢数据。
-/// 2. 每行既尝试解析 `data: {...}` SSE 格式，也尝试裸 JSON，避免非流式响应
-///    带尾换行时 usage 被整行丢弃。
+/// 关键修复：
+/// 1. **`data:` 前缀带不带空格都能解析**——兼容 OpenAI 官方 SDK（`data: {...}`）
+///    和部分网关（`data:{...}`，无空格）两种变体
+/// 2. **按字节累积**——避免 chunk 边界落在多字节字符中间导致丢数据
+/// 3. **每行都尝试剥 `data:` 前缀**——非流式响应整段 JSON 也能被当行解析
 pub fn try_extract_usage_from_chunk(chunk: &[u8], buf: &mut Vec<u8>) -> Option<UsageInfo> {
     buf.extend_from_slice(chunk);
 
@@ -267,10 +286,19 @@ pub fn try_extract_usage_from_chunk(chunk: &[u8], buf: &mut Vec<u8>) -> Option<U
         if buf[i] != b'\n' {
             continue;
         }
-        let line = String::from_utf8_lossy(&buf[line_start..i]);
-        let line = line.trim();
-        // SSE 前缀剥掉后当作 JSON；否则原样尝试
-        let json_str = line.strip_prefix("data: ").unwrap_or(line);
+        let raw_line = String::from_utf8_lossy(&buf[line_start..i]);
+        let line = raw_line.trim();
+
+        // ⭐ 关键：data: 后空格可有可无
+        let json_str = if let Some(stripped) = line.strip_prefix("data:") {
+            stripped.trim_start()
+        } else if line.starts_with(':') {
+            // SSE 注释行（: ping），跳过
+            ""
+        } else {
+            line
+        };
+
         if !json_str.is_empty() && json_str != "[DONE]" {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
                 if let Some(u) = v.get("usage") {
@@ -290,10 +318,17 @@ pub fn try_extract_usage_from_chunk(chunk: &[u8], buf: &mut Vec<u8>) -> Option<U
     // 无换行的整段 JSON（常见于非流式响应）
     if latest.is_none() && !buf.is_empty() {
         if let Ok(s) = std::str::from_utf8(buf) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) {
-                if let Some(u) = v.get("usage") {
-                    if !u.is_null() {
-                        latest = Some(UsageInfo::from_json(u));
+            let trimmed = s.trim();
+            let candidate = trimmed
+                .strip_prefix("data:")
+                .map(|x| x.trim_start())
+                .unwrap_or(trimmed);
+            if !candidate.is_empty() && candidate != "[DONE]" {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                    if let Some(u) = v.get("usage") {
+                        if !u.is_null() {
+                            latest = Some(UsageInfo::from_json(u));
+                        }
                     }
                 }
             }
@@ -317,7 +352,43 @@ pub struct MetricsGuard {
 
 impl Drop for MetricsGuard {
     fn drop(&mut self) {
-        let usage = self.tracker.usage.lock().unwrap().clone();
+        let real_usage = self.tracker.usage.lock().unwrap().clone();
+
+        // ⭐ Fallback 估算：上游没返回 usage 时，按字符数粗估
+        // 系数：英文约 4 字符/token，中文约 1.5 字符/token，混合取 3
+        let usage = if real_usage.is_some() {
+            real_usage
+        } else {
+            let prompt = self.tracker.estimated_prompt_tokens;
+            let streamed = self.tracker.streamed_chars.load(Ordering::Relaxed);
+            let completion = (streamed / 3).max(1);
+            let total = prompt + completion;
+            if total > 0 {
+                Some(UsageInfo {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: total,
+                    cached_tokens: 0,
+                    reasoning_tokens: 0,
+                })
+            } else {
+                None
+            }
+        };
+
+        let is_real = real_usage_available(&usage, &self.tracker);
+        let tokens = usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+
+        debug!(
+            target: "zen_proxy::metrics",
+            "metric: model={} status={} latency={}ms tokens={} real_usage={}",
+            self.tracker.model,
+            self.tracker.status,
+            self.tracker.start.elapsed().as_millis(),
+            tokens,
+            is_real,
+        );
+
         let metric = RequestMetric {
             timestamp_secs: now_secs(),
             latency_ms: self.tracker.start.elapsed().as_millis() as u64,
@@ -326,9 +397,22 @@ impl Drop for MetricsGuard {
             usage,
         };
         self.metrics.record(metric);
-        self.metrics.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .active_requests
+            .fetch_sub(1, Ordering::Relaxed);
         if self.tracker.is_stream {
-            self.metrics.active_streams.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .active_streams
+                .fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// 判断 usage 是"真"还是"估算"
+fn real_usage_available(usage: &Option<UsageInfo>, tracker: &TrackerState) -> bool {
+    if usage.is_none() {
+        return false;
+    }
+    // 如果上游从没填过 usage，但 tracker 有字符统计 → 是估算
+    tracker.usage.lock().map(|u| u.is_some()).unwrap_or(false)
 }

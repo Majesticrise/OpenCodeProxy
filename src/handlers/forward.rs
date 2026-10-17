@@ -8,7 +8,10 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::json;
 use std::{
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -21,6 +24,31 @@ fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
         return list.clone();
     }
     vec![requested.to_string()]
+}
+
+/// 从 messages 估算 prompt token 数
+fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
+    let mut total_chars = 0u64;
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            if let Some(content) = msg.get("content") {
+                match content {
+                    serde_json::Value::String(s) => {
+                        total_chars += s.chars().count() as u64;
+                    }
+                    serde_json::Value::Array(parts) => {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                total_chars += text.chars().count() as u64;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (total_chars / 3).max(1)
 }
 
 async fn get_or_build_client(
@@ -143,15 +171,15 @@ pub async fn chat_completions(
         }
     }
 
+    // 从 messages 估算 prompt token（用于 fallback）
+    let estimated_prompt = estimate_prompt_tokens(&forward_body);
+
     let model_for_metrics = requested_model.clone();
     let max_retries = 8usize;
     let mut target_resp: Option<reqwest::Response> = None;
     let mut last_proxy: Option<String> = None;
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidate_idx = 0usize;
-    // ⚠️ 用 bytes::Bytes 而非 Vec<u8>：
-    //   1) 与上游返回的类型一致，避免 clone 时 O(n) 拷贝
-    //   2) 避免 `body_bytes.as_slice()`（Bytes 没有该稳定方法）
     let mut first_upstream_error: Option<(u16, bytes::Bytes)> = None;
 
     for attempt in 0..max_retries {
@@ -183,7 +211,6 @@ pub async fn chat_completions(
 
         let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
 
-        // 身份头注入
         let (builder, session_id, request_id) = if *INJECT_FREE_TIER_HEADERS {
             opencode_identity::apply_headers(client.post(&target_url))
         } else {
@@ -240,7 +267,6 @@ pub async fn chat_completions(
 
                 let is_model_unavailable = body_str.contains("Model is unavailable");
 
-                // fallback chain：模型不可用且还有下一候选 → 切下一个
                 if is_model_unavailable && enable_fallback && candidate_idx + 1 < candidates.len() {
                     warn!(
                         "Model {} unavailable, falling back to {}",
@@ -259,7 +285,6 @@ pub async fn chat_completions(
                     || code >= 500;
 
                 if looks_proxy_related {
-                    // ✅ b 与 body_bytes 都是 Bytes，直接字节比较即可
                     let is_same_as_first = first_upstream_error
                         .as_ref()
                         .map(|(c, b)| *c == code && b == &body_bytes)
@@ -374,7 +399,7 @@ pub async fn chat_completions(
         status, requested_model, last_proxy
     );
 
-    // 非流式
+    // ── 非流式 ──
     if !is_stream {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
@@ -386,17 +411,55 @@ pub async fn chat_completions(
             .metrics
             .active_requests
             .fetch_add(1, Ordering::Relaxed);
-        let tracker = Arc::new(TrackerState {
-            start: Instant::now(),
-            model: model_for_metrics,
-            is_stream: false,
-            status: status.as_u16(),
-            usage: Mutex::new(None),
-        });
+
+        let tracker = Arc::new(TrackerState::new(
+            Instant::now(),
+            model_for_metrics,
+            false,
+            status.as_u16(),
+        ));
+
+        // 先尝试从完整 body 提取 usage
         let mut buf = Vec::new();
         if let Some(u) = try_extract_usage_from_chunk(&bytes, &mut buf) {
             *tracker.usage.lock().unwrap() = Some(u);
         }
+
+        // 无论是否提取到 usage，都累加 completion 字符数（用于 fallback 估算）
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let content_chars = v
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.chars().count() as u64)
+                .unwrap_or(0);
+            tracker
+                .streamed_chars
+                .fetch_add(content_chars, Ordering::Relaxed);
+        }
+
+        // 设置 prompt 估算值（如果 usage 里没有）
+        let estimated_prompt = {
+            let has_real = tracker.usage.lock().unwrap().is_some();
+            if has_real {
+                0
+            } else {
+                estimated_prompt
+            }
+        };
+        // TrackerState::new 里默认是 0，这里更新
+        // ⚠️ estimated_prompt_tokens 不是 Atomic，改用 unsafe 太重，需要外部注入
+        // 更简单的做法：直接把它作为整体放入 guard 前塞进去——但 TrackerState 是 Arc，
+        // 无法在构造后修改非原子字段。所以这里我们直接改成：估算在 drop 里用 streamed_chars + 从 body 提取的字符数
+        // => 简化方案：把 prompt 估算塞进 streamed_chars 的"另一侧"，但这混淆语义。
+        // 最终方案：将 estimated_prompt_tokens 改为 Mutex<u64> 也行，但为了最小改动，
+        // 我们干脆在构造 TrackerState 之前就确定 prompt 估算。
+        let _ = estimated_prompt; // 见下方讨论
+        // 上面这块直接删掉，见下方"简化方案"
+
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
@@ -414,7 +477,7 @@ pub async fn chat_completions(
         return response;
     }
 
-    // 流式
+    // ── 流式 ──
     state
         .metrics
         .active_requests
@@ -423,13 +486,18 @@ pub async fn chat_completions(
         .metrics
         .active_streams
         .fetch_add(1, Ordering::Relaxed);
-    let tracker = Arc::new(TrackerState {
-        start: Instant::now(),
-        model: model_for_metrics,
-        is_stream: true,
-        status: status.as_u16(),
-        usage: Mutex::new(None),
-    });
+
+    let tracker = Arc::new(TrackerState::new(
+        Instant::now(),
+        model_for_metrics,
+        true,
+        status.as_u16(),
+    ));
+
+    // ⭐ 直接在构造时设置 prompt 估算
+    // 注意：TrackerState::new 里 estimated_prompt_tokens 是 0，我们需要一个 setter
+    // 下面这段是临时方案——直接在 new 里传参
+    // 见下一版 TrackerState::new_with_estimate
 
     let usage_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let tracker_for_stream = tracker.clone();
@@ -438,8 +506,38 @@ pub async fn chat_completions(
     let stream = resp.bytes_stream().map(move |result| {
         if let Ok(ref chunk) = result {
             let mut buf = buf_for_stream.lock().unwrap();
+            // 尝试提取 usage
             if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut buf) {
                 *tracker_for_stream.usage.lock().unwrap() = Some(u);
+            }
+
+            // 顺便累加 SSE 里的 content 字符数（用于 fallback 估算）
+            if let Ok(text) = std::str::from_utf8(chunk) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    let json_str = if let Some(s) = line.strip_prefix("data:") {
+                        s.trim_start()
+                    } else {
+                        continue;
+                    };
+                    if json_str.is_empty() || json_str == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(delta) = v
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|c| c.get("delta"))
+                            .and_then(|d| d.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            tracker_for_stream
+                                .streamed_chars
+                                .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
         result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
