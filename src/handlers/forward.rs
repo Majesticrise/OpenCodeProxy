@@ -4,7 +4,6 @@ use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -150,7 +149,10 @@ pub async fn chat_completions(
     let mut last_proxy: Option<String> = None;
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidate_idx = 0usize;
-    let mut first_upstream_error: Option<(u16, Vec<u8>)> = None;
+    // ⚠️ 用 bytes::Bytes 而非 Vec<u8>：
+    //   1) 与上游返回的类型一致，避免 clone 时 O(n) 拷贝
+    //   2) 避免 `body_bytes.as_slice()`（Bytes 没有该稳定方法）
+    let mut first_upstream_error: Option<(u16, bytes::Bytes)> = None;
 
     for attempt in 0..max_retries {
         let current_upstream = candidates
@@ -257,9 +259,10 @@ pub async fn chat_completions(
                     || code >= 500;
 
                 if looks_proxy_related {
+                    // ✅ b 与 body_bytes 都是 Bytes，直接字节比较即可
                     let is_same_as_first = first_upstream_error
                         .as_ref()
-                        .map(|(c, b)| *c == code && b.as_slice() == body_bytes.as_slice())
+                        .map(|(c, b)| *c == code && b == &body_bytes)
                         .unwrap_or(false);
 
                     if is_same_as_first {
