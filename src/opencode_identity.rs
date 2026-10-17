@@ -39,76 +39,127 @@ pub fn generate_request_id() -> String {
     format!("msg_{}{}", hex_full, suffix)
 }
 
-/// 向请求体注入免费层工具契约
-/// 规则：
-///   - tools 必须包含 read，且 read.parameters.properties 非空
-///   - tools 至少 2 个，否则补 bash
-///   - 客户端传的 read 若 parameters 为 null / properties 为空，会被就地补全
+/// 免费层要求的四个占位工具及其最小非空 schema。
+/// 来自 PR #16826 的实测：
+/// - read 必须有非空 properties（否则 403）
+/// - bash 的 parameters 不能是 {}（否则 403）
+/// - glob / grep 同理，但优先级低于 read / bash
+fn placeholder_schema(name: &str) -> Option<serde_json::Value> {
+    match name {
+        "bash" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" }
+            },
+            "required": ["command"]
+        })),
+        "read" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filePath": { "type": "string" }
+            },
+            "required": ["filePath"]
+        })),
+        "glob" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" }
+            },
+            "required": ["pattern"]
+        })),
+        "grep" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" }
+            },
+            "required": ["pattern"]
+        })),
+        _ => None,
+    }
+}
+
+/// 确保指定名称的工具存在，并且其 parameters 是非空的合法 schema。
+fn ensure_tool_with_schema(arr: &mut Vec<serde_json::Value>, name: &str, description: &str) {
+    // 1) 查找是否已存在
+    let existing_idx = arr.iter().position(|t| {
+        t.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            == Some(name)
+    });
+
+    if let Some(idx) = existing_idx {
+        // 已存在：强制修复 parameters，防止空对象或 properties 为空
+        let Some(func) = arr[idx].get_mut("function").and_then(|f| f.as_object_mut()) else {
+            return;
+        };
+        let params = func
+            .entry("parameters")
+            .or_insert_with(|| serde_json::json!({}));
+
+        let props_ok = params
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+
+        if !props_ok {
+            if let Some(schema) = placeholder_schema(name) {
+                *params = schema;
+            }
+        }
+        return;
+    }
+
+    // 2) 不存在：插入完整定义
+    let Some(schema) = placeholder_schema(name) else {
+        return;
+    };
+    arr.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": schema
+        }
+    }));
+}
+
+/// 向请求体注入免费层工具契约。
+///
+/// 规则（2026-10-14 之后）：
+/// - tools 必须包含 read，且 read.parameters.properties 非空
+/// - bash 的 parameters 不能是空对象 {}
+/// - tools 数量至少 2
+/// - 客户端已传入的工具会被保留，但若 schema 为空会被就地修复
 pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
-    let obj = match body.as_object_mut() {
-        Some(o) => o,
-        None => return,
+    let Some(obj) = body.as_object_mut() else {
+        return;
     };
     let tools = obj.entry("tools").or_insert_with(|| serde_json::json!([]));
-    let arr = match tools.as_array_mut() {
-        Some(a) => a,
-        None => return,
+    let Some(arr) = tools.as_array_mut() else {
+        return;
     };
 
+    // 先修复客户端可能传入的「空壳」read / bash / glob / grep
+    for name in ["read", "bash", "glob", "grep"] {
+        ensure_tool_with_schema(arr, name, tool_description(name));
+    }
+
+    // 保证 read 一定存在（ensure_tool_with_schema 已处理，这里再兜一层）
     let has_read = arr.iter().any(|t| {
         t.get("function")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
             == Some("read")
     });
-
     if !has_read {
-        // 没有 read，直接补一个完整定义
-        arr.push(serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "filePath": { "type": "string" } },
-                    "required": ["filePath"]
-                }
-            }
-        }));
-    } else {
-        // 已有 read：确保 parameters 存在，且 properties 非空
-        for t in arr.iter_mut() {
-            let is_read = t
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                == Some("read");
-            if !is_read {
-                continue;
-            }
-            if let Some(func) = t.get_mut("function").and_then(|f| f.as_object_mut()) {
-                let params = func
-                    .entry("parameters")
-                    .or_insert_with(|| serde_json::json!({}));
-                let props_ok = params
-                    .get("properties")
-                    .and_then(|v| v.as_object())
-                    .map(|o| !o.is_empty())
-                    .unwrap_or(false);
-                if !props_ok {
-                    *params = serde_json::json!({
-                        "type": "object",
-                        "properties": { "filePath": { "type": "string" } },
-                        "required": ["filePath"]
-                    });
-                }
-            }
-        }
+        ensure_tool_with_schema(arr, "read", "Read a file");
     }
 
-    // 保证至少 2 个工具，若没有 bash 则补一个
+    // 保证至少 2 个工具
     if arr.len() < 2 {
+        // 如果只有 read，补 bash
         let has_bash = arr.iter().any(|t| {
             t.get("function")
                 .and_then(|f| f.get("name"))
@@ -116,24 +167,53 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
                 == Some("bash")
         });
         if !has_bash {
-            arr.push(serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": "Run a bash command",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "command": { "type": "string" } },
-                        "required": ["command"]
-                    }
-                }
-            }));
+            ensure_tool_with_schema(arr, "bash", "Run a bash command");
+        }
+    }
+
+    // 最终检查：遍历所有工具，把仍为空的 parameters 填成最小 schema
+    for t in arr.iter_mut() {
+        let Some(func) = t.get_mut("function").and_then(|f| f.as_object_mut()) else {
+            continue;
+        };
+        let Some(name) = func.get("name").and_then(|n| n.as_str()).map(String::from) else {
+            continue;
+        };
+        let params = func
+            .entry("parameters")
+            .or_insert_with(|| serde_json::json!({}));
+        let is_empty = params
+            .as_object()
+            .map(|o| o.is_empty())
+            .unwrap_or(true);
+        if is_empty {
+            if let Some(schema) = placeholder_schema(&name) {
+                *params = schema;
+            } else {
+                // 非 quartet 工具，给一个通用的非空 schema，避免某些严格后端拒绝
+                *params = serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "input": { "type": "string" }
+                    },
+                    "required": ["input"]
+                });
+            }
         }
     }
 }
 
-/// 构造请求头，返回 (builder, session_id, request_id) 供日志使用
-/// UA 来自 config::OPENCODE_UA（可通过环境变量 OPENCODE_UA 覆盖）
+fn tool_description(name: &str) -> &'static str {
+    match name {
+        "read" => "Read a file",
+        "bash" => "Run a bash command",
+        "glob" => "Match files by pattern",
+        "grep" => "Search file contents by pattern",
+        _ => "",
+    }
+}
+
+/// 构造请求头，返回 (builder, session_id, request_id) 供日志使用。
 pub fn apply_headers(
     builder: reqwest::RequestBuilder,
 ) -> (reqwest::RequestBuilder, String, String) {
