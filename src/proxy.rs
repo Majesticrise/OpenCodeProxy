@@ -13,24 +13,18 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-/// 429 限流后的短冷却
 const COOLDOWN_RATE_LIMIT: Duration = Duration::from_secs(30);
-/// 连接错误 / 超时后的长冷却
 const COOLDOWN_CONNECTION: Duration = Duration::from_secs(300);
-/// 连续失败达到该次数后真正移除
+/// 403 FreeTierError 冷却（比连接错误略短，给 IP 信誉恢复留窗口）
+const COOLDOWN_BANNED: Duration = Duration::from_secs(900);
 const MAX_FAILS_BEFORE_REMOVE: u32 = 3;
-
-// ───────────────────────── 代理条目 ─────────────────────────
 
 #[derive(Clone)]
 pub struct ProxyEntry {
     pub url: String,
     pub latency: f64,
-    /// 处于冷却期时 now < cooldown_until 视为不可用
     pub cooldown_until: Option<Instant>,
-    /// 连续失败次数
     pub fail_count: u32,
-    /// 最近一次成功时间（诊断用）
     pub last_success: Option<Instant>,
 }
 
@@ -50,13 +44,11 @@ impl ProxyEntry {
     }
 }
 
-/// 失败分类，决定冷却时长
 #[derive(Clone, Copy)]
 pub enum FailureKind {
-    /// HTTP 429，短冷却
     RateLimit,
-    /// 连接错误 / 超时 / 5xx，长冷却
     Connection,
+    Banned,
 }
 
 impl FailureKind {
@@ -64,11 +56,23 @@ impl FailureKind {
         match self {
             FailureKind::RateLimit => COOLDOWN_RATE_LIMIT,
             FailureKind::Connection => COOLDOWN_CONNECTION,
+            FailureKind::Banned => COOLDOWN_BANNED,
+        }
+    }
+
+    /// Banned 不累加 fail_count，避免误删有希望的代理
+    fn counts_toward_removal(self) -> bool {
+        matches!(self, FailureKind::Connection)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            FailureKind::RateLimit => "rate-limited",
+            FailureKind::Connection => "connection-error",
+            FailureKind::Banned => "banned",
         }
     }
 }
-
-// ───────────────────────── 池内部与句柄 ─────────────────────────
 
 pub struct ProxyPoolInner {
     pub proxies: Vec<ProxyEntry>,
@@ -80,19 +84,15 @@ pub struct ProxyPoolInner {
 #[derive(Clone)]
 pub struct ProxyPool {
     pub inner: Arc<RwLock<ProxyPoolInner>>,
-    /// 原子标志，避免并发触发重复抓取
     pub is_fetching: Arc<AtomicBool>,
 }
 
-/// RAII guard：spawn 任务结束（含 panic）时自动重置 is_fetching
 struct FetchingReset(Arc<AtomicBool>);
 impl Drop for FetchingReset {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
-
-// ───────────────────────── 实现 ─────────────────────────
 
 impl ProxyPool {
     pub fn new(file_path: &str) -> Self {
@@ -110,7 +110,6 @@ impl ProxyPool {
     pub async fn load_proxies(&self) {
         let file_path = { self.inner.read().await.file_path.clone() };
 
-        // 1. 优先读取本地 proxies.txt
         if Path::new(&file_path).exists() {
             if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
                 let mut file_proxies = Vec::new();
@@ -139,7 +138,6 @@ impl ProxyPool {
             }
         }
 
-        // 2. 其次读取持久化的 verified_proxies.json（格式仍是 [(url, latency)])
         if let Ok(content) = tokio::fs::read_to_string("verified_proxies.json").await {
             if let Ok(validated) = serde_json::from_str::<Vec<(String, f64)>>(&content) {
                 if !validated.is_empty() {
@@ -155,12 +153,10 @@ impl ProxyPool {
             }
         }
 
-        // 3. 最后才触发网络抓取
         self.fetch_free_proxies().await;
     }
 
     pub async fn fetch_free_proxies(&self) {
-        // 原子 check-and-set，消除并发窗口
         if self
             .is_fetching
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -171,7 +167,6 @@ impl ProxyPool {
 
         let self_clone = self.clone();
         tokio::spawn(async move {
-            // 无论正常返回还是 panic，Drop 都会重置 is_fetching
             let _reset = FetchingReset(self_clone.is_fetching.clone());
 
             info!("Fetching free proxy list from multiple public APIs...");
@@ -215,7 +210,7 @@ impl ProxyPool {
 
             if raw_ips.is_empty() {
                 error!("All public proxy sources failed or returned empty list.");
-                return; // guard 会重置 is_fetching
+                return;
             }
 
             let raw_proxies: Vec<String> = raw_ips
@@ -231,7 +226,7 @@ impl ProxyPool {
     }
 
     async fn validate_proxies(&self, raw_proxies: Vec<String>) {
-        let sample_size = std::cmp::min(3000, raw_proxies.len());
+        let sample_size = std::cmp::min(7000, raw_proxies.len());
         let mut test_targets = raw_proxies;
         test_targets.shuffle(&mut rand::thread_rng());
         test_targets.truncate(sample_size);
@@ -240,7 +235,6 @@ impl ProxyPool {
         let mut validated = Vec::new();
         let target = VALIDATE_TARGET.clone();
 
-        // 分块流式验证，内存友好
         let mut stream = stream::iter(test_targets.into_iter().map(|proxy| {
             let sem = sem.clone();
             let target = target.clone();
@@ -278,7 +272,6 @@ impl ProxyPool {
                 validated[0].1
             );
 
-            // 持久化：仍用 [(url, latency)] 元组格式，保持向后兼容
             let to_save: Vec<(String, f64)> =
                 validated.iter().map(|(u, l)| (u.clone(), *l)).collect();
             match serde_json::to_string_pretty(&to_save) {
@@ -292,7 +285,6 @@ impl ProxyPool {
                 Err(e) => warn!("Failed to serialize proxy pool: {}", e),
             }
 
-            // 覆盖内存池（重置所有冷却 / 失败计数）
             let mut inner = self.inner.write().await;
             inner.proxies = validated
                 .into_iter()
@@ -305,7 +297,6 @@ impl ProxyPool {
         }
     }
 
-    /// 随机取一个未处于冷却期的代理（偏向前 15 个低延迟者）
     pub async fn get_proxy(&self) -> Option<String> {
         let inner = self.inner.read().await;
         let now = Instant::now();
@@ -325,17 +316,19 @@ impl ProxyPool {
         slice.choose(&mut rand::thread_rng()).map(|x| x.url.clone())
     }
 
-    /// 连接失败 / 超时 / 5xx：长冷却，连续失败达阈值后移除
     pub async fn report_failure(&self, proxy_url: &str) {
-        self.report_failure_kind(proxy_url, FailureKind::Connection).await;
+        self.report_kind(proxy_url, FailureKind::Connection).await;
     }
 
-    /// HTTP 429：短冷却，不立即移除
     pub async fn report_rate_limit(&self, proxy_url: &str) {
-        self.report_failure_kind(proxy_url, FailureKind::RateLimit).await;
+        self.report_kind(proxy_url, FailureKind::RateLimit).await;
     }
 
-    /// 请求成功：清零失败计数与冷却
+    /// 403 FreeTierError：长冷却但不累计 fail_count
+    pub async fn report_banned(&self, proxy_url: &str) {
+        self.report_kind(proxy_url, FailureKind::Banned).await;
+    }
+
     pub async fn report_success(&self, proxy_url: &str) {
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
@@ -345,17 +338,22 @@ impl ProxyPool {
         }
     }
 
-    async fn report_failure_kind(&self, proxy_url: &str, kind: FailureKind) {
+    async fn report_kind(&self, proxy_url: &str, kind: FailureKind) {
         let cooldown = kind.cooldown();
+        let counts = kind.counts_toward_removal();
+        let label = kind.label();
+
         let (after_len, fetching) = {
             let mut inner = self.inner.write().await;
             let now = Instant::now();
 
             let mut should_remove = false;
             if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
-                entry.fail_count += 1;
+                if counts {
+                    entry.fail_count += 1;
+                }
                 entry.cooldown_until = Some(now + cooldown);
-                should_remove = entry.fail_count >= MAX_FAILS_BEFORE_REMOVE;
+                should_remove = counts && entry.fail_count >= MAX_FAILS_BEFORE_REMOVE;
             }
 
             if should_remove {
@@ -369,13 +367,8 @@ impl ProxyPool {
                 );
             } else {
                 warn!(
-                    "Proxy {} marked as {:?}, cooldown {:?}",
-                    proxy_url,
-                    match kind {
-                        FailureKind::RateLimit => "rate-limited",
-                        FailureKind::Connection => "connection-error",
-                    },
-                    cooldown
+                    "Proxy {} marked as {}, cooldown {:?}",
+                    proxy_url, label, cooldown
                 );
             }
 

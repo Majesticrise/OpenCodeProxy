@@ -6,10 +6,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::Ordering,
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -26,6 +26,7 @@ fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     vec![requested.to_string()]
 }
 
+/// 从 messages 估算 prompt token 数（用于 fallback）
 fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
     let mut total_chars = 0u64;
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -86,8 +87,10 @@ async fn pick_unused_proxy(
     None
 }
 
-/// 将上游的 SSE 流聚合为标准的非流式 JSON 响应体
-async fn aggregate_sse_to_json(resp: reqwest::Response) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
+/// 将上游 SSE 流聚合为 OpenAI 兼容的非流式 JSON
+async fn aggregate_sse_to_json(
+    resp: reqwest::Response,
+) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::<u8>::new();
     let mut content = String::new();
@@ -98,11 +101,11 @@ async fn aggregate_sse_to_json(resp: reqwest::Response) -> Result<(Vec<u8>, Opti
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream error: {}", e))?;
         buf.extend_from_slice(&chunk);
-        // 扫描完整的行
+
         let mut start = 0;
         while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
             let end = start + pos;
-            let line = String::from_utf8_lossy(&buf[start..end]);
+            let line = String::from_utf8_lossy(&buf[start..end]).to_string();
             start = end + 1;
             let line = line.trim();
             let json_str = if let Some(s) = line.strip_prefix("data:") {
@@ -146,31 +149,27 @@ async fn aggregate_sse_to_json(resp: reqwest::Response) -> Result<(Vec<u8>, Opti
         }
     }
 
-    // 构造非流式 JSON
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     let response_json = json!({
-        "id": if id.is_empty() { format!("chatcmpl-{}", uuid_like()) } else { id },
+        "id": if id.is_empty() { format!("chatcmpl-{}", created) } else { id },
         "object": "chat.completion",
-        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        "created": created,
         "model": if model.is_empty() { "unknown" } else { &model },
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": { "role": "assistant", "content": content },
             "finish_reason": "stop"
         }],
         "usage": usage
     });
 
-    let bytes = serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
+    let bytes =
+        serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
     Ok((bytes, usage))
-}
-
-fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    format!("{:x}", ts)
 }
 
 pub async fn chat_completions(
@@ -206,7 +205,6 @@ pub async fn chat_completions(
         .and_then(|m| m.as_str())
         .unwrap_or("deepseek-v4-flash-free")
         .to_string();
-    // 下游是否请求流式
     let downstream_stream = body_json
         .get("stream")
         .and_then(|s| s.as_bool())
@@ -234,9 +232,8 @@ pub async fn chat_completions(
     let mut forward_body = body_json;
     if let Some(obj) = forward_body.as_object_mut() {
         obj.remove("variant");
-        // ⭐ 强制上游流式（即使下游要求非流式）
+        // ⭐ 关键：上游必须强制 stream: true
         obj.insert("stream".to_string(), json!(true));
-        // 确保 stream_options
         obj.entry("stream_options")
             .or_insert_with(|| json!({ "include_usage": true }));
     }
@@ -297,7 +294,7 @@ pub async fn chat_completions(
             )
         };
 
-        // ⭐ 关键：强制 Accept: text/event-stream
+        // 强制 Accept: text/event-stream
         let builder = builder.header("Accept", "text/event-stream");
 
         info!(
@@ -342,9 +339,24 @@ pub async fn chat_completions(
                 let body_bytes = resp.bytes().await.unwrap_or_default();
                 let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
+                // ⭐ 403 FreeTierError：视为会话 / IP 层风控，代理进入长冷却，
+                // 下次尝试会生成新 session（apply_headers 每次调用都会新建）
+                if code == 403 && body_str.contains("FreeTierError") {
+                    warn!(
+                        "Proxy {:?} hit 403 FreeTierError. Banning for 15min; will retry with new session.",
+                        proxy
+                    );
+                    if let Some(ref p) = proxy {
+                        state.pool.report_banned(p).await;
+                    }
+                    // 不增加 fail_count，只做冷却；换一个代理立刻重试
+                    continue;
+                }
+
                 let is_model_unavailable = body_str.contains("Model is unavailable");
 
-                if is_model_unavailable && enable_fallback && candidate_idx + 1 < candidates.len() {
+                if is_model_unavailable && enable_fallback && candidate_idx + 1 < candidates.len()
+                {
                     warn!(
                         "Model {} unavailable, falling back to {}",
                         current_upstream,
@@ -411,6 +423,7 @@ pub async fn chat_completions(
         }
     }
 
+    // 直连兜底
     let resp = match target_resp {
         Some(r) => r,
         None => {
@@ -479,9 +492,10 @@ pub async fn chat_completions(
     // ── 非流式下游：聚合 SSE 为 JSON ──
     if !downstream_stream {
         let (bytes, usage) = match aggregate_sse_to_json(resp).await {
-            Ok((b, u)) => (b, u),
+            Ok(x) => x,
             Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("aggregate failed: {e}")).into_response()
+                return (StatusCode::BAD_GATEWAY, format!("aggregate failed: {e}"))
+                    .into_response()
             }
         };
 

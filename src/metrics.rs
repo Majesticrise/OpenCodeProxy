@@ -122,10 +122,10 @@ pub struct MetricsStore {
 
 impl MetricsStore {
     /// 纯内存模式
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::with_persistence(None)
     }
-
     /// 带持久化路径；None 等于纯内存
     pub fn with_persistence(path: Option<PathBuf>) -> Self {
         let totals = match &path {
