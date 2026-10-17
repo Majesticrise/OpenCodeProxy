@@ -1,11 +1,17 @@
 mod config;
 mod handlers;
 mod logger;
+mod metrics;
 mod middleware;
 mod proxy;
 mod state;
 
-use crate::{logger::LogBuffer, logger::WebLogWriter, proxy::ProxyPool, state::AppState};
+use crate::{
+    logger::{LogBuffer, LogLayer},
+    metrics::MetricsStore,
+    proxy::ProxyPool,
+    state::AppState,
+};
 use axum::{
     middleware,
     routing::{get, post},
@@ -13,17 +19,22 @@ use axum::{
 };
 use std::{env, path::Path, sync::Arc, time::Duration};
 use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() {
     let log_buffer = Arc::new(LogBuffer::new());
     let filter = env::var("RUST_LOG").unwrap_or_else(|_| config::LOG_LEVEL.to_string());
 
-    // 初始化 tracing，将日志同时输出到终端和 Web 端
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_writer(WebLogWriter { buffer: log_buffer.clone() })
-        .finish();
+    // 终端输出走 fmt::layer，Web 缓冲走自定义 LogLayer
+    let subscriber = tracing_subscriber::registry()
+        .with(EnvFilter::new(filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                // 容器 / 日志采集环境建议关闭 ANSI 颜色
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())),
+        )
+        .with(LogLayer::new(log_buffer.clone()));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     info!("============================================================");
@@ -32,7 +43,9 @@ async fn main() {
 
     let proxy_pool = ProxyPool::new(&config::PROXY_FILE);
     let pool_clone = proxy_pool.clone();
-    tokio::spawn(async move { pool_clone.load_proxies().await; });
+    tokio::spawn(async move {
+        pool_clone.load_proxies().await;
+    });
 
     let pool_refresh = proxy_pool.clone();
     tokio::spawn(async move {
@@ -50,6 +63,7 @@ async fn main() {
     let state = AppState {
         pool: proxy_pool,
         log_buffer: log_buffer.clone(),
+        metrics: Arc::new(MetricsStore::new()),
     };
 
     let app = Router::new()
@@ -58,6 +72,7 @@ async fn main() {
         .route("/health", get(handlers::health))
         .route("/api/status", get(handlers::api_status))
         .route("/api/logs", get(handlers::api_logs))
+        .route("/api/metrics", get(handlers::api_metrics))
         .route("/api/toggle", post(handlers::api_toggle))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))

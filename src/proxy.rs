@@ -1,4 +1,4 @@
-use crate::config::PROXY_FILE;
+use crate::config::{MIN_POOL_SIZE, PROXY_FILE, VALIDATE_TARGET};
 use futures_util::stream::{self, StreamExt};
 use rand::seq::SliceRandom;
 use std::{
@@ -15,7 +15,6 @@ use tracing::{error, info, warn};
 
 pub struct ProxyPoolInner {
     pub proxies: Vec<(String, f64)>,
-    pub is_fetching: bool,
     pub file_path: String,
     pub is_running: AtomicBool,
     pub total_requests: AtomicU64,
@@ -24,6 +23,16 @@ pub struct ProxyPoolInner {
 #[derive(Clone)]
 pub struct ProxyPool {
     pub inner: Arc<RwLock<ProxyPoolInner>>,
+    /// 原子标志，避免并发触发重复抓取
+    pub is_fetching: Arc<AtomicBool>,
+}
+
+/// RAII guard：spawn 任务结束（含 panic）时自动重置 is_fetching
+struct FetchingReset(Arc<AtomicBool>);
+impl Drop for FetchingReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl ProxyPool {
@@ -31,11 +40,11 @@ impl ProxyPool {
         Self {
             inner: Arc::new(RwLock::new(ProxyPoolInner {
                 proxies: Vec::new(),
-                is_fetching: false,
                 file_path: file_path.to_string(),
                 is_running: AtomicBool::new(true),
                 total_requests: AtomicU64::new(0),
             })),
+            is_fetching: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -48,16 +57,27 @@ impl ProxyPool {
                 let mut file_proxies = Vec::new();
                 for line in content.lines() {
                     let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') { continue; }
-                    let proxy_url = if !(line.starts_with("http://") || line.starts_with("https://") || line.starts_with("socks5://")) {
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let proxy_url = if !(line.starts_with("http://")
+                        || line.starts_with("https://")
+                        || line.starts_with("socks5://"))
+                    {
                         format!("http://{}", line)
-                    } else { line.to_string() };
+                    } else {
+                        line.to_string()
+                    };
                     file_proxies.push((proxy_url, 0.0));
                 }
                 if !file_proxies.is_empty() {
                     let mut inner = self.inner.write().await;
                     inner.proxies = file_proxies;
-                    info!("Loaded {} proxies from local file {}", inner.proxies.len(), file_path);
+                    info!(
+                        "Loaded {} proxies from local file {}",
+                        inner.proxies.len(),
+                        file_path
+                    );
                     return;
                 }
             }
@@ -69,7 +89,10 @@ impl ProxyPool {
                 if !validated.is_empty() {
                     let mut inner = self.inner.write().await;
                     inner.proxies = validated;
-                    info!("Loaded {} proxies from verified_proxies.json", inner.proxies.len());
+                    info!(
+                        "Loaded {} proxies from verified_proxies.json",
+                        inner.proxies.len()
+                    );
                     return;
                 }
             }
@@ -80,11 +103,20 @@ impl ProxyPool {
     }
 
     pub async fn fetch_free_proxies(&self) {
-        if self.inner.read().await.is_fetching { return; }
-        self.inner.write().await.is_fetching = true;
+        // 原子 check-and-set，消除并发窗口
+        if self
+            .is_fetching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
 
         let self_clone = self.clone();
         tokio::spawn(async move {
+            // 无论正常返回还是 panic，Drop 都会重置 is_fetching
+            let _reset = FetchingReset(self_clone.is_fetching.clone());
+
             info!("Fetching free proxy list from multiple public APIs...");
             let sources = vec![
                 "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -102,7 +134,10 @@ impl ProxyPool {
             ];
 
             let mut raw_ips = HashSet::new();
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(8)).build().unwrap();
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .build()
+                .unwrap();
 
             for url in sources {
                 match client.get(url).send().await {
@@ -110,7 +145,9 @@ impl ProxyPool {
                         if let Ok(text) = resp.text().await {
                             for line in text.lines() {
                                 let line = line.trim();
-                                if !line.is_empty() { raw_ips.insert(line.to_string()); }
+                                if !line.is_empty() {
+                                    raw_ips.insert(line.to_string());
+                                }
                             }
                         }
                     }
@@ -121,12 +158,17 @@ impl ProxyPool {
 
             if raw_ips.is_empty() {
                 error!("All public proxy sources failed or returned empty list.");
-                self_clone.inner.write().await.is_fetching = false;
-                return;
+                return; // guard 会重置 is_fetching
             }
 
-            let raw_proxies: Vec<String> = raw_ips.into_iter().map(|ip| format!("http://{}", ip)).collect();
-            info!("Fetched {} unique raw proxies. Starting background validation...", raw_proxies.len());
+            let raw_proxies: Vec<String> = raw_ips
+                .into_iter()
+                .map(|ip| format!("http://{}", ip))
+                .collect();
+            info!(
+                "Fetched {} unique raw proxies. Starting background validation...",
+                raw_proxies.len()
+            );
             self_clone.validate_proxies(raw_proxies).await;
         });
     }
@@ -139,23 +181,29 @@ impl ProxyPool {
 
         let sem = Arc::new(tokio::sync::Semaphore::new(200));
         let mut validated = Vec::new();
+        let target = VALIDATE_TARGET.clone();
 
         // 分块流式验证，内存友好
         let mut stream = stream::iter(test_targets.into_iter().map(|proxy| {
             let sem = sem.clone();
+            let target = target.clone();
             async move {
                 let _permit = sem.acquire().await.unwrap();
                 let start = Instant::now();
                 let client = reqwest::Client::builder()
                     .proxy(reqwest::Proxy::all(&proxy).ok()?)
                     .timeout(Duration::from_millis(5000))
-                    .build().ok()?;
-                match client.get("https://opencode.ai").send().await {
-                    Ok(resp) if resp.status() == 200 => Some((proxy, start.elapsed().as_secs_f64())),
+                    .build()
+                    .ok()?;
+                match client.get(&target).send().await {
+                    Ok(resp) if resp.status() == 200 => {
+                        Some((proxy, start.elapsed().as_secs_f64()))
+                    }
                     _ => None,
                 }
             }
-        })).buffer_unordered(200);
+        }))
+        .buffer_unordered(200);
 
         while let Some(result) = stream.next().await {
             if let Some(item) = result {
@@ -168,10 +216,13 @@ impl ProxyPool {
 
         let mut inner = self.inner.write().await;
         inner.proxies = validated.clone();
-        inner.is_fetching = false;
 
         if !validated.is_empty() {
-            info!("Proxy pool updated: {} high-speed verified proxies ready. (Fastest: {:.2}s)", validated.len(), validated[0].1);
+            info!(
+                "Proxy pool updated: {} high-speed verified proxies ready. (Fastest: {:.2}s)",
+                validated.len(),
+                validated[0].1
+            );
             // 持久化
             let json_str = serde_json::to_string_pretty(&validated).unwrap_or_default();
             if let Err(e) = tokio::fs::write("verified_proxies.json", json_str).await {
@@ -186,23 +237,34 @@ impl ProxyPool {
 
     pub async fn get_proxy(&self) -> Option<String> {
         let inner = self.inner.read().await;
-        if inner.proxies.is_empty() { return None; }
+        if inner.proxies.is_empty() {
+            return None;
+        }
         let limit = std::cmp::min(15, inner.proxies.len());
         let slice = &inner.proxies[..limit];
         slice.choose(&mut rand::thread_rng()).map(|x| x.0.clone())
     }
 
     pub async fn report_failure(&self, proxy_url: &str) {
-        let mut inner = self.inner.write().await;
-        let before_len = inner.proxies.len();
-        inner.proxies.retain(|x| x.0 != proxy_url);
-        let after_len = inner.proxies.len();
-        if before_len != after_len {
-            warn!("Removed failed proxy: {}. Active pool size: {}", proxy_url, after_len);
-        }
-        if after_len < 10 && !inner.is_fetching {
+        let (after_len, fetching) = {
+            let mut inner = self.inner.write().await;
+            let before_len = inner.proxies.len();
+            inner.proxies.retain(|x| x.0 != proxy_url);
+            let after_len = inner.proxies.len();
+            if before_len != after_len {
+                warn!(
+                    "Removed failed proxy: {}. Active pool size: {}",
+                    proxy_url, after_len
+                );
+            }
+            (after_len, self.is_fetching.load(Ordering::Relaxed))
+        };
+
+        if after_len < *MIN_POOL_SIZE && !fetching {
             let self_clone = self.clone();
-            tokio::spawn(async move { self_clone.fetch_free_proxies().await; });
+            tokio::spawn(async move {
+                self_clone.fetch_free_proxies().await;
+            });
         }
     }
 }
