@@ -613,3 +613,10 @@ select:focus { border-color: var(--accent); }
 .toast.show { opacity: 1; transform: none; }
 .toast.ok { border-color: var(--green); }
 .toast.err { border-color: var(--red); }
+.bar-row {
+    display: grid;
+    grid-template-columns: minmax(90px, 140px) 1fr 96px;   /* 64px → 96px */
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+}

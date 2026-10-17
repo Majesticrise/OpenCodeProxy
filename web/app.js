@@ -8,12 +8,21 @@ function escapeHtml(s) {
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+/** 缩写格式：190.09K / 1.23M（用于图表 Y 轴等空间受限场景） */
 function fmtNum(n) {
     if (n == null) return '0';
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
     if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
     return String(n);
+}
+
+/** 精确格式：带千分位，190,090（用于 Token、请求数等核心指标） */
+function fmtExact(n) {
+    if (n == null) return '0';
+    const num = Number(n);
+    if (!Number.isFinite(num)) return '0';
+    return num.toLocaleString('en-US');
 }
 
 function toast(msg, kind = '') {
@@ -43,9 +52,8 @@ const state = {
     models: [],
     pgSending: false,
     pgAccum: '',
-    // 路由
     upstreamModels: [],
-    routeRows: [],      // [{key, candidates: "a,b"}]
+    routeRows: [],
     enableFallback: true,
 };
 
@@ -122,15 +130,33 @@ async function fetchMetrics() {
 function renderMetrics() {
     const m = state.metrics;
     if (!m) return;
-    $('#m-total').textContent = fmtNum(m.total_requests || 0);
+
+    // 总请求数、Token 相关：精确数字
+    $('#m-total').textContent = fmtExact(m.total_requests || 0);
+    $('#m-total').title = `精确值: ${fmtExact(m.total_requests || 0)} 次`;
     $('#m-success').textContent = (m.success_rate || 0).toFixed(1) + '%';
     $('#m-p95').innerHTML = (m.p95_latency || 0) + '<small>ms</small>';
-    $('#m-active').textContent = m.active_requests || 0;
-    $('#m-active-streams').textContent = '流式 ' + (m.active_streams || 0);
-    $('#t-total').textContent = fmtNum(m.total_tokens || 0);
-    $('#t-cached').textContent = fmtNum(m.cached_tokens || 0);
-    $('#t-reasoning').textContent = fmtNum(m.reasoning_tokens || 0);
+    $('#m-active').textContent = fmtExact(m.active_requests || 0);
+    $('#m-active-streams').textContent = '流式 ' + fmtExact(m.active_streams || 0);
+
+    const totalTokens = m.total_tokens || 0;
+    const cachedTokens = m.cached_tokens || 0;
+    const reasoningTokens = m.reasoning_tokens || 0;
+
+    $('#t-total').textContent = fmtExact(totalTokens);
+    $('#t-total').title = `精确值: ${fmtExact(totalTokens)} tokens` +
+        (totalTokens >= 1000 ? ` (${fmtNum(totalTokens)})` : '');
+
+    $('#t-cached').textContent = fmtExact(cachedTokens);
+    $('#t-cached').title = `精确值: ${fmtExact(cachedTokens)} tokens` +
+        (totalTokens > 0 ? ` · 占比 ${((cachedTokens / totalTokens) * 100).toFixed(1)}%` : '');
+
+    $('#t-reasoning').textContent = fmtExact(reasoningTokens);
+    $('#t-reasoning').title = `精确值: ${fmtExact(reasoningTokens)} tokens` +
+        (totalTokens > 0 ? ` · 占比 ${((reasoningTokens / totalTokens) * 100).toFixed(1)}%` : '');
+
     $('#t-coverage').textContent = (m.usage_coverage || 0).toFixed(1) + '%';
+
     renderModelList(m.models || []);
     renderStatusList(m.endpoints || []);
 }
@@ -142,10 +168,12 @@ function renderModelList(models) {
     const max = Math.max(...sorted.map((x) => x[1][2]), 1);
     box.innerHTML = sorted.map(([name, v]) => {
         const pct = Math.max(2, (v[2] / max) * 100);
-        return `<div class="bar-row">
+        const exact = fmtExact(v[2]);
+        const tip = `${name}\nprompt: ${fmtExact(v[0])}\ncompletion: ${fmtExact(v[1])}\ntotal: ${exact}`;
+        return `<div class="bar-row" title="${escapeHtml(tip)}">
             <div class="bar-label" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
             <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
-            <div class="bar-val">${fmtNum(v[2])}</div>
+            <div class="bar-val">${exact}</div>
         </div>`;
     }).join('');
 }
@@ -161,7 +189,7 @@ function renderStatusList(endpoints) {
         return `<div class="bar-row">
             <div class="bar-label">HTTP ${code}</div>
             <div class="bar-track"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>
-            <div class="bar-val">${count}</div>
+            <div class="bar-val">${fmtExact(count)}</div>
         </div>`;
     }).join('');
 }
@@ -204,6 +232,7 @@ function drawChart() {
         ctx.moveTo(padL, y);
         ctx.lineTo(padL + cw, y);
         ctx.stroke();
+        // Y 轴保持缩写（空间有限）
         ctx.fillText(fmtNum(Math.round(maxVal * (1 - i / 4))), padL - 6, y);
     }
     const slotW = cw / data.length;
@@ -315,15 +344,12 @@ async function loadUpstreamModels(forceRefresh = false) {
             ${escapeHtml(m)}
         </span>
     `).join('');
-    // 点击 chip 快速添加到规则表
     box.querySelectorAll('.model-chip').forEach((el) => {
         el.addEventListener('click', () => {
             const m = el.dataset.model;
-            // 追加到第一行的候选列表，或新建一行
             if (state.routeRows.length === 0) {
                 state.routeRows.push({ key: m, candidates: m });
             } else {
-                // 加到最后一个非 * 行的候选
                 const target = state.routeRows.find((r) => r.key !== '*') || state.routeRows[0];
                 const existing = target.candidates.split(',').map((s) => s.trim()).filter(Boolean);
                 if (!existing.includes(m)) existing.push(m);
@@ -375,7 +401,6 @@ function renderRouteTable() {
         </tr>
     `).join('');
 
-    // 绑定 input 事件：实时同步到 state
     tbody.querySelectorAll('tr').forEach((tr) => {
         const idx = +tr.dataset.idx;
         tr.querySelector('.r-key').addEventListener('input', (e) => {
@@ -392,7 +417,6 @@ function renderRouteTable() {
 }
 
 async function saveRouting() {
-    // 收集有效行
     const mapping = {};
     for (const row of state.routeRows) {
         const key = row.key.trim();
@@ -423,7 +447,7 @@ async function saveRouting() {
         const d = await r.json();
         if (d.ok) {
             toast('路由已更新并生效', 'ok');
-            await loadModels(); // 刷新 Playground 的模型下拉
+            await loadModels();
         } else {
             toast('保存失败', 'err');
         }
@@ -547,7 +571,6 @@ function bindEvents() {
     });
     $('#logClear').addEventListener('click', clearLogs);
 
-    // 路由
     $('#btnProbe').addEventListener('click', () => loadUpstreamModels(true));
     $('#btnAddRule').addEventListener('click', () => {
         state.routeRows.push({ key: '', candidates: '' });
@@ -555,7 +578,6 @@ function bindEvents() {
     });
     $('#btnSaveRouting').addEventListener('click', saveRouting);
 
-    // Playground
     $('#pgSend').addEventListener('click', sendPlayground);
     $('#pgClear').addEventListener('click', () => {
         $('#pgInput').value = '';
@@ -573,7 +595,6 @@ function bindEvents() {
         if (state.view === 'dashboard') drawChart();
     });
 
-    // 页面不可见时暂停轮询
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
             fetchStatus();

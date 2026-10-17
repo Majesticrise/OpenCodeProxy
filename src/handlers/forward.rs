@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use serde_json::json;
 use std::{
     sync::{
@@ -176,7 +176,6 @@ pub async fn chat_completions(
 ) -> impl IntoResponse {
     use crate::metrics::{try_extract_usage_from_chunk, MetricsGuard, TrackerState};
 
-    // ⭐ 请求入口开始计时（修复 P95 延迟 1ms 问题）
     let request_start = Instant::now();
 
     if !state
@@ -548,62 +547,99 @@ pub async fn chat_completions(
     let tracker_for_stream = tracker.clone();
     let buf_for_stream = usage_buf.clone();
 
-    // ⭐ 关键修复：上游流中断时，不直接传播 io::Error（会让 axum abort 响应，
-    // 客户端看到 ERR_INCOMPLETE_CHUNKED_ENCODING），而是优雅补发 `data: [DONE]`。
-    let stream = resp.bytes_stream().map(move |result| {
-        match result {
-            Ok(chunk) => {
-                // 提取 usage
-                {
-                    let mut buf = buf_for_stream.lock().unwrap();
-                    if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut buf) {
-                        *tracker_for_stream.usage.lock().unwrap() = Some(u);
-                    }
-                }
+    // ⭐ 关键修复：用 stream::unfold 显式管理状态。
+    //   上游流断裂时 reqwest 会反复返回 Err，必须只处理一次并结束流，
+    //   否则会刷屏日志 + 发出成百上千个 [DONE]，让客户端无法解析。
+    //
+    //   状态三元组：
+    //     - done：是否已经处理过错误 → true 后立即返回 None 结束流
+    //     - received_any：是否已收到过有效 chunk
+    //     - 首次 Err 且 !received_any → 发 error event + [DONE]（让客户端知道失败原因）
+    //     - 首次 Err 且 received_any  → 发 [DONE]（正常结束已开始的流）
+    let byte_stream = resp.bytes_stream();
 
-                // 累加 SSE content 字符数（fallback 估算用）
-                if let Ok(text) = std::str::from_utf8(&chunk) {
-                    for line in text.lines() {
-                        let line = line.trim();
-                        let json_str = if let Some(s) = line.strip_prefix("data:") {
-                            s.trim_start()
-                        } else {
-                            continue;
-                        };
-                        if json_str.is_empty() || json_str == "[DONE]" {
-                            continue;
+    let stream = stream::unfold(
+        (byte_stream, false, false, tracker_for_stream, buf_for_stream),
+        move |(mut inner, done, received_any, tracker, buf)| async move {
+            if done {
+                return None;
+            }
+
+            match inner.next().await {
+                Some(Ok(chunk)) => {
+                    // 处理 usage
+                    {
+                        let mut b = buf.lock().unwrap();
+                        if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut b) {
+                            *tracker.usage.lock().unwrap() = Some(u);
                         }
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            if let Some(delta) = v
-                                .get("choices")
-                                .and_then(|c| c.as_array())
-                                .and_then(|a| a.first())
-                                .and_then(|c| c.get("delta"))
-                                .and_then(|d| d.get("content"))
-                                .and_then(|c| c.as_str())
-                            {
-                                tracker_for_stream
-                                    .streamed_chars
-                                    .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
+                    }
+
+                    // 累加 SSE content 字符数（fallback 估算用）
+                    if let Ok(text) = std::str::from_utf8(&chunk) {
+                        for line in text.lines() {
+                            let line = line.trim();
+                            let json_str = if let Some(s) = line.strip_prefix("data:") {
+                                s.trim_start()
+                            } else {
+                                continue;
+                            };
+                            if json_str.is_empty() || json_str == "[DONE]" {
+                                continue;
+                            }
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if let Some(delta) = v
+                                    .get("choices")
+                                    .and_then(|c| c.as_array())
+                                    .and_then(|a| a.first())
+                                    .and_then(|c| c.get("delta"))
+                                    .and_then(|d| d.get("content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    tracker
+                                        .streamed_chars
+                                        .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
-                }
 
-                Ok::<_, std::io::Error>(chunk)
+                    Some((
+                        Ok::<_, std::io::Error>(chunk),
+                        (inner, false, true, tracker, buf),
+                    ))
+                }
+                Some(Err(e)) => {
+                    let body: bytes::Bytes = if !received_any {
+                        // 一个字节都没收到就失败 → 发一个 OpenAI 兼容的 error 事件，
+                        // 让客户端能展示错误提示，而不是 "no choices"
+                        let err_json = serde_json::json!({
+                            "error": {
+                                "type": "proxy_upstream_error",
+                                "message": format!("Upstream stream broke before any data: {}", e)
+                            }
+                        });
+                        warn!(
+                            "Upstream SSE stream broke before any chunk arrived: {}. Sending error event.",
+                            e
+                        );
+                        bytes::Bytes::from(format!(
+                            "\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            err_json
+                        ))
+                    } else {
+                        warn!("Upstream SSE stream broken: {}. Sending [DONE].", e);
+                        bytes::Bytes::from_static(b"\n\ndata: [DONE]\n\n")
+                    };
+                    Some((
+                        Ok::<_, std::io::Error>(body),
+                        (inner, true, received_any, tracker, buf),
+                    ))
+                }
+                None => None,
             }
-            Err(e) => {
-                // 上游流断裂：记录日志，发 [DONE] 让流正常结束
-                warn!(
-                    "Upstream SSE stream broken: {}. Sending [DONE] to close gracefully.",
-                    e
-                );
-                Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                    b"\n\ndata: [DONE]\n\n",
-                ))
-            }
-        }
-    });
+        },
+    );
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
