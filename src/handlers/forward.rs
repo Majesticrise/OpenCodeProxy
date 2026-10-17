@@ -10,7 +10,7 @@ use serde_json::json;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -26,7 +26,7 @@ fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     vec![requested.to_string()]
 }
 
-/// 从 messages 估算 prompt token 数
+/// 从 messages 估算 prompt token 数（用于 fallback）
 fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
     let mut total_chars = 0u64;
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -92,7 +92,6 @@ pub async fn chat_completions(
     body_bytes: bytes::Bytes,
 ) -> impl IntoResponse {
     use crate::metrics::{try_extract_usage_from_chunk, MetricsGuard, TrackerState};
-    use std::sync::Mutex;
 
     if !state
         .pool
@@ -163,7 +162,7 @@ pub async fn chat_completions(
         opencode_identity::inject_free_tier_tools(&mut forward_body);
     }
 
-    // 流式请求强制要求上游回报 usage，供 metrics 统计
+    // 流式请求强制要求上游回报 usage
     if is_stream {
         if let Some(obj) = forward_body.as_object_mut() {
             obj.entry("stream_options")
@@ -412,11 +411,13 @@ pub async fn chat_completions(
             .active_requests
             .fetch_add(1, Ordering::Relaxed);
 
+        // ⭐ 传 estimated_prompt 作为第 5 参数
         let tracker = Arc::new(TrackerState::new(
             Instant::now(),
             model_for_metrics,
             false,
             status.as_u16(),
+            estimated_prompt,
         ));
 
         // 先尝试从完整 body 提取 usage
@@ -425,7 +426,7 @@ pub async fn chat_completions(
             *tracker.usage.lock().unwrap() = Some(u);
         }
 
-        // 无论是否提取到 usage，都累加 completion 字符数（用于 fallback 估算）
+        // 累加 completion 字符数（用于 fallback）
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             let content_chars = v
                 .get("choices")
@@ -440,25 +441,6 @@ pub async fn chat_completions(
                 .streamed_chars
                 .fetch_add(content_chars, Ordering::Relaxed);
         }
-
-        // 设置 prompt 估算值（如果 usage 里没有）
-        let estimated_prompt = {
-            let has_real = tracker.usage.lock().unwrap().is_some();
-            if has_real {
-                0
-            } else {
-                estimated_prompt
-            }
-        };
-        // TrackerState::new 里默认是 0，这里更新
-        // ⚠️ estimated_prompt_tokens 不是 Atomic，改用 unsafe 太重，需要外部注入
-        // 更简单的做法：直接把它作为整体放入 guard 前塞进去——但 TrackerState 是 Arc，
-        // 无法在构造后修改非原子字段。所以这里我们直接改成：估算在 drop 里用 streamed_chars + 从 body 提取的字符数
-        // => 简化方案：把 prompt 估算塞进 streamed_chars 的"另一侧"，但这混淆语义。
-        // 最终方案：将 estimated_prompt_tokens 改为 Mutex<u64> 也行，但为了最小改动，
-        // 我们干脆在构造 TrackerState 之前就确定 prompt 估算。
-        let _ = estimated_prompt; // 见下方讨论
-        // 上面这块直接删掉，见下方"简化方案"
 
         headers.insert(
             axum::http::header::CONTENT_TYPE,
@@ -487,17 +469,14 @@ pub async fn chat_completions(
         .active_streams
         .fetch_add(1, Ordering::Relaxed);
 
+    // ⭐ 同样传 estimated_prompt 作为第 5 参数
     let tracker = Arc::new(TrackerState::new(
         Instant::now(),
         model_for_metrics,
         true,
         status.as_u16(),
+        estimated_prompt,
     ));
-
-    // ⭐ 直接在构造时设置 prompt 估算
-    // 注意：TrackerState::new 里 estimated_prompt_tokens 是 0，我们需要一个 setter
-    // 下面这段是临时方案——直接在 new 里传参
-    // 见下一版 TrackerState::new_with_estimate
 
     let usage_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let tracker_for_stream = tracker.clone();
@@ -511,7 +490,7 @@ pub async fn chat_completions(
                 *tracker_for_stream.usage.lock().unwrap() = Some(u);
             }
 
-            // 顺便累加 SSE 里的 content 字符数（用于 fallback 估算）
+            // 累加 SSE content 字符数（fallback）
             if let Ok(text) = std::str::from_utf8(chunk) {
                 for line in text.lines() {
                     let line = line.trim();

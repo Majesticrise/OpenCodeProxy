@@ -83,10 +83,28 @@ async fn main() {
         );
     }
 
+    // ── Metrics（累计数字持久化到磁盘） ──
+    let metrics_path = if *config::PERSIST_METRICS {
+        Some(std::path::PathBuf::from(&*config::METRICS_FILE))
+    } else {
+        None
+    };
+    let metrics = Arc::new(MetricsStore::with_persistence(metrics_path));
+
+    // 后台每 5 秒 flush 一次
+    let metrics_for_flush = metrics.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            metrics_for_flush.flush_if_dirty().await;
+        }
+    });
+
+    // ── 组装 AppState ──
     let state = AppState {
         pool: proxy_pool,
         log_buffer: log_buffer.clone(),
-        metrics: Arc::new(MetricsStore::new()),
+        metrics,
         client_cache: Arc::new(DashMap::new()),
         routing: Arc::new(RwLock::new(routing)),
         upstream_models: Arc::new(RwLock::new(Default::default())),

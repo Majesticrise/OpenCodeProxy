@@ -34,6 +34,15 @@ lazy_static::lazy_static! {
     pub static ref INJECT_FREE_TIER_TOOLS: bool = env::var("INJECT_FREE_TIER_TOOLS")
         .map(|v| v != "false" && v != "0")
         .unwrap_or(true);
+
+    /// metrics 聚合总量的持久化文件（只存数字，不存明细）
+    pub static ref METRICS_FILE: String =
+        env::var("METRICS_FILE").unwrap_or_else(|_| "metrics_totals.json".to_string());
+
+    /// 是否持久化 metrics（默认开）
+    pub static ref PERSIST_METRICS: bool = env::var("PERSIST_METRICS")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
