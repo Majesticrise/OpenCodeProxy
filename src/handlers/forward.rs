@@ -26,7 +26,6 @@ fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     vec![requested.to_string()]
 }
 
-/// 从 messages 估算 prompt token 数（用于 fallback）
 fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
     let mut total_chars = 0u64;
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -87,7 +86,6 @@ async fn pick_unused_proxy(
     None
 }
 
-/// 将上游 SSE 流聚合为 OpenAI 兼容的非流式 JSON
 async fn aggregate_sse_to_json(
     resp: reqwest::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
@@ -178,6 +176,9 @@ pub async fn chat_completions(
 ) -> impl IntoResponse {
     use crate::metrics::{try_extract_usage_from_chunk, MetricsGuard, TrackerState};
 
+    // ⭐ 请求入口开始计时（修复 P95 延迟 1ms 问题）
+    let request_start = Instant::now();
+
     if !state
         .pool
         .inner
@@ -232,13 +233,11 @@ pub async fn chat_completions(
     let mut forward_body = body_json;
     if let Some(obj) = forward_body.as_object_mut() {
         obj.remove("variant");
-        // ⭐ 关键：上游必须强制 stream: true
         obj.insert("stream".to_string(), json!(true));
         obj.entry("stream_options")
             .or_insert_with(|| json!({ "include_usage": true }));
     }
 
-    // 免费层工具契约注入
     if *INJECT_FREE_TIER_TOOLS {
         opencode_identity::inject_free_tier_tools(&mut forward_body);
     }
@@ -294,7 +293,6 @@ pub async fn chat_completions(
             )
         };
 
-        // 强制 Accept: text/event-stream
         let builder = builder.header("Accept", "text/event-stream");
 
         info!(
@@ -339,8 +337,6 @@ pub async fn chat_completions(
                 let body_bytes = resp.bytes().await.unwrap_or_default();
                 let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
-                // ⭐ 403 FreeTierError：视为会话 / IP 层风控，代理进入长冷却，
-                // 下次尝试会生成新 session（apply_headers 每次调用都会新建）
                 if code == 403 && body_str.contains("FreeTierError") {
                     warn!(
                         "Proxy {:?} hit 403 FreeTierError. Banning for 15min; will retry with new session.",
@@ -349,7 +345,6 @@ pub async fn chat_completions(
                     if let Some(ref p) = proxy {
                         state.pool.report_banned(p).await;
                     }
-                    // 不增加 fail_count，只做冷却；换一个代理立刻重试
                     continue;
                 }
 
@@ -423,7 +418,6 @@ pub async fn chat_completions(
         }
     }
 
-    // 直连兜底
     let resp = match target_resp {
         Some(r) => r,
         None => {
@@ -505,7 +499,7 @@ pub async fn chat_completions(
             .fetch_add(1, Ordering::Relaxed);
 
         let tracker = Arc::new(TrackerState::new(
-            Instant::now(),
+            request_start,
             model_for_metrics,
             false,
             status.as_u16(),
@@ -543,7 +537,7 @@ pub async fn chat_completions(
         .fetch_add(1, Ordering::Relaxed);
 
     let tracker = Arc::new(TrackerState::new(
-        Instant::now(),
+        request_start,
         model_for_metrics,
         true,
         status.as_u16(),
@@ -554,42 +548,61 @@ pub async fn chat_completions(
     let tracker_for_stream = tracker.clone();
     let buf_for_stream = usage_buf.clone();
 
+    // ⭐ 关键修复：上游流中断时，不直接传播 io::Error（会让 axum abort 响应，
+    // 客户端看到 ERR_INCOMPLETE_CHUNKED_ENCODING），而是优雅补发 `data: [DONE]`。
     let stream = resp.bytes_stream().map(move |result| {
-        if let Ok(ref chunk) = result {
-            let mut buf = buf_for_stream.lock().unwrap();
-            if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut buf) {
-                *tracker_for_stream.usage.lock().unwrap() = Some(u);
-            }
-
-            if let Ok(text) = std::str::from_utf8(chunk) {
-                for line in text.lines() {
-                    let line = line.trim();
-                    let json_str = if let Some(s) = line.strip_prefix("data:") {
-                        s.trim_start()
-                    } else {
-                        continue;
-                    };
-                    if json_str.is_empty() || json_str == "[DONE]" {
-                        continue;
+        match result {
+            Ok(chunk) => {
+                // 提取 usage
+                {
+                    let mut buf = buf_for_stream.lock().unwrap();
+                    if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut buf) {
+                        *tracker_for_stream.usage.lock().unwrap() = Some(u);
                     }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(delta) = v
-                            .get("choices")
-                            .and_then(|c| c.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|c| c.get("delta"))
-                            .and_then(|d| d.get("content"))
-                            .and_then(|c| c.as_str())
-                        {
-                            tracker_for_stream
-                                .streamed_chars
-                                .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
+                }
+
+                // 累加 SSE content 字符数（fallback 估算用）
+                if let Ok(text) = std::str::from_utf8(&chunk) {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        let json_str = if let Some(s) = line.strip_prefix("data:") {
+                            s.trim_start()
+                        } else {
+                            continue;
+                        };
+                        if json_str.is_empty() || json_str == "[DONE]" {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            if let Some(delta) = v
+                                .get("choices")
+                                .and_then(|c| c.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|c| c.get("delta"))
+                                .and_then(|d| d.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                tracker_for_stream
+                                    .streamed_chars
+                                    .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
+
+                Ok::<_, std::io::Error>(chunk)
+            }
+            Err(e) => {
+                // 上游流断裂：记录日志，发 [DONE] 让流正常结束
+                warn!(
+                    "Upstream SSE stream broken: {}. Sending [DONE] to close gracefully.",
+                    e
+                );
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    b"\n\ndata: [DONE]\n\n",
+                ))
             }
         }
-        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     });
 
     let mut response = Response::new(Body::from_stream(stream));
