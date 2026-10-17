@@ -2,8 +2,9 @@ use std::{collections::HashMap, env};
 use serde::{Deserialize, Serialize};
 
 lazy_static::lazy_static! {
+    /// 免费层走 /inference/v1（2026-10-14 之后）
     pub static ref ZEN_UPSTREAM: String =
-        env::var("ZEN_UPSTREAM").unwrap_or_else(|_| "https://opencode.ai/zen/v1".to_string());
+        env::var("ZEN_UPSTREAM").unwrap_or_else(|_| "https://opencode.ai/inference/v1".to_string());
     pub static ref LISTEN_HOST: String =
         env::var("LISTEN_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     pub static ref LISTEN_PORT: u16 =
@@ -18,16 +19,27 @@ lazy_static::lazy_static! {
         env::var("MIN_POOL_SIZE").unwrap_or_else(|_| "10".to_string()).parse().unwrap_or(10);
     pub static ref LOG_BUFFER_CAP: usize =
         env::var("LOG_BUFFER_CAP").unwrap_or_else(|_| "500".to_string()).parse().unwrap_or(500);
+
+    /// OpenCode CLI 的 User-Agent，版本必须 >= 1.18.0
+    /// 默认值来自抓包真实客户端
+    pub static ref OPENCODE_UA: String = env::var("OPENCODE_UA")
+        .unwrap_or_else(|_| "opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14".to_string());
+
+    /// 是否注入免费层身份头（默认开）
+    pub static ref INJECT_FREE_TIER_HEADERS: bool = env::var("INJECT_FREE_TIER_HEADERS")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+
+    /// 是否注入免费层 tools 契约（默认开）
+    pub static ref INJECT_FREE_TIER_TOOLS: bool = env::var("INJECT_FREE_TIER_TOOLS")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
 }
 
-/// 运行时路由规则（可在 WebUI 里修改，无需重启）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    /// 客户端模型名 → 有序上游候选列表（第一个优先）
-    /// key 为 "*" 时作为兜底
     #[serde(default)]
     pub mapping: HashMap<String, Vec<String>>,
-    /// 是否启用 fallback chain：模型不可用时自动切下一个候选
     #[serde(default = "default_true")]
     pub enable_fallback_chain: bool,
 }
@@ -41,11 +53,6 @@ impl Default for RoutingConfig {
 }
 
 impl RoutingConfig {
-    /// 从环境变量初始化：
-    ///   MODEL_OVERRIDE=big-pickle
-    ///     等价于 "*": ["big-pickle"]
-    ///   MODEL_MAPPING="deepseek-v4-flash-free:big-pickle|minimax-m3-free,*:minimax-m3-free"
-    ///     "|" 分隔同一 key 下的候选顺序
     pub fn from_env() -> Self {
         let mut mapping = HashMap::new();
         if let Ok(raw) = env::var("MODEL_MAPPING") {
