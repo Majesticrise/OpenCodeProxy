@@ -5,17 +5,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// 对齐 OpenCode CLI Identifier.descending("ses")
-/// 格式：ses_ + 12位hex + 14位Base62，总长30
 pub fn generate_session_id() -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFF;
+    // ⭐ 关键：counter 必须限制在 0..=63
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed) & 0x3F;
     let raw = ((ts_ms & 0xFFFF_FFFF) << 12) | counter;
     let inverted = !raw & 0xFFFF_FFFF_FFFF;
     let hex_full = format!("{:012x}", inverted);
+    // 此时 hex_full 的末尾应自然落在 fc0..fff 范围内
     let mut rng = rand::thread_rng();
     let suffix: String = (0..14)
         .map(|_| BASE62[rng.gen_range(0..62)] as char)

@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -26,7 +26,6 @@ fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     vec![requested.to_string()]
 }
 
-/// 从 messages 估算 prompt token 数（用于 fallback）
 fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
     let mut total_chars = 0u64;
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -87,6 +86,93 @@ async fn pick_unused_proxy(
     None
 }
 
+/// 将上游的 SSE 流聚合为标准的非流式 JSON 响应体
+async fn aggregate_sse_to_json(resp: reqwest::Response) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::<u8>::new();
+    let mut content = String::new();
+    let mut usage: Option<crate::metrics::UsageInfo> = None;
+    let mut id = String::new();
+    let mut model = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("stream error: {}", e))?;
+        buf.extend_from_slice(&chunk);
+        // 扫描完整的行
+        let mut start = 0;
+        while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
+            let end = start + pos;
+            let line = String::from_utf8_lossy(&buf[start..end]);
+            start = end + 1;
+            let line = line.trim();
+            let json_str = if let Some(s) = line.strip_prefix("data:") {
+                s.trim_start()
+            } else {
+                continue;
+            };
+            if json_str.is_empty() || json_str == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if id.is_empty() {
+                    if let Some(i) = v.get("id").and_then(|i| i.as_str()) {
+                        id = i.to_string();
+                    }
+                }
+                if model.is_empty() {
+                    if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                        model = m.to_string();
+                    }
+                }
+                if let Some(u) = v.get("usage") {
+                    if !u.is_null() {
+                        usage = Some(crate::metrics::UsageInfo::from_json(u));
+                    }
+                }
+                if let Some(delta) = v
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    content.push_str(delta);
+                }
+            }
+        }
+        if start > 0 {
+            buf.drain(..start);
+        }
+    }
+
+    // 构造非流式 JSON
+    let response_json = json!({
+        "id": if id.is_empty() { format!("chatcmpl-{}", uuid_like()) } else { id },
+        "object": "chat.completion",
+        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        "model": if model.is_empty() { "unknown" } else { &model },
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": usage
+    });
+
+    let bytes = serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
+    Ok((bytes, usage))
+}
+
+fn uuid_like() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("{:x}", ts)
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     body_bytes: bytes::Bytes,
@@ -120,7 +206,8 @@ pub async fn chat_completions(
         .and_then(|m| m.as_str())
         .unwrap_or("deepseek-v4-flash-free")
         .to_string();
-    let is_stream = body_json
+    // 下游是否请求流式
+    let downstream_stream = body_json
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
@@ -129,20 +216,12 @@ pub async fn chat_completions(
     let candidates = resolve_candidates(&routing_snapshot, &requested_model);
     let enable_fallback = routing_snapshot.enable_fallback_chain;
 
-    if candidates.len() == 1 && candidates[0] == requested_model {
-        info!(
-            "→ {} model={}",
-            if is_stream { "STREAM" } else { "SYNC  " },
-            requested_model
-        );
-    } else {
-        info!(
-            "→ {} requested={} candidates={:?}",
-            if is_stream { "STREAM" } else { "SYNC  " },
-            requested_model,
-            candidates
-        );
-    }
+    info!(
+        "→ {} model={} (downstream_stream={})",
+        if downstream_stream { "STREAM" } else { "SYNC  " },
+        requested_model,
+        downstream_stream
+    );
 
     state
         .pool
@@ -155,6 +234,11 @@ pub async fn chat_completions(
     let mut forward_body = body_json;
     if let Some(obj) = forward_body.as_object_mut() {
         obj.remove("variant");
+        // ⭐ 强制上游流式（即使下游要求非流式）
+        obj.insert("stream".to_string(), json!(true));
+        // 确保 stream_options
+        obj.entry("stream_options")
+            .or_insert_with(|| json!({ "include_usage": true }));
     }
 
     // 免费层工具契约注入
@@ -162,15 +246,6 @@ pub async fn chat_completions(
         opencode_identity::inject_free_tier_tools(&mut forward_body);
     }
 
-    // 流式请求强制要求上游回报 usage
-    if is_stream {
-        if let Some(obj) = forward_body.as_object_mut() {
-            obj.entry("stream_options")
-                .or_insert_with(|| json!({ "include_usage": true }));
-        }
-    }
-
-    // 从 messages 估算 prompt token（用于 fallback）
     let estimated_prompt = estimate_prompt_tokens(&forward_body);
 
     let model_for_metrics = requested_model.clone();
@@ -221,6 +296,9 @@ pub async fn chat_completions(
                 String::new(),
             )
         };
+
+        // ⭐ 关键：强制 Accept: text/event-stream
+        let builder = builder.header("Accept", "text/event-stream");
 
         info!(
             "attempt {}/{} model={} proxy={:?} session={} request={}",
@@ -333,7 +411,6 @@ pub async fn chat_completions(
         }
     }
 
-    // 直连兜底
     let resp = match target_resp {
         Some(r) => r,
         None => {
@@ -361,6 +438,7 @@ pub async fn chat_completions(
                     String::new(),
                 )
             };
+            let builder = builder.header("Accept", "text/event-stream");
             match builder.json(&forward_body).send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -398,20 +476,20 @@ pub async fn chat_completions(
         status, requested_model, last_proxy
     );
 
-    // ── 非流式 ──
-    if !is_stream {
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
+    // ── 非流式下游：聚合 SSE 为 JSON ──
+    if !downstream_stream {
+        let (bytes, usage) = match aggregate_sse_to_json(resp).await {
+            Ok((b, u)) => (b, u),
             Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("read body: {e}")).into_response()
+                return (StatusCode::BAD_GATEWAY, format!("aggregate failed: {e}")).into_response()
             }
         };
+
         state
             .metrics
             .active_requests
             .fetch_add(1, Ordering::Relaxed);
 
-        // ⭐ 传 estimated_prompt 作为第 5 参数
         let tracker = Arc::new(TrackerState::new(
             Instant::now(),
             model_for_metrics,
@@ -419,27 +497,8 @@ pub async fn chat_completions(
             status.as_u16(),
             estimated_prompt,
         ));
-
-        // 先尝试从完整 body 提取 usage
-        let mut buf = Vec::new();
-        if let Some(u) = try_extract_usage_from_chunk(&bytes, &mut buf) {
+        if let Some(u) = usage {
             *tracker.usage.lock().unwrap() = Some(u);
-        }
-
-        // 累加 completion 字符数（用于 fallback）
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let content_chars = v
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|a| a.first())
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .map(|s| s.chars().count() as u64)
-                .unwrap_or(0);
-            tracker
-                .streamed_chars
-                .fetch_add(content_chars, Ordering::Relaxed);
         }
 
         headers.insert(
@@ -459,7 +518,7 @@ pub async fn chat_completions(
         return response;
     }
 
-    // ── 流式 ──
+    // ── 流式下游：直接转发 SSE ──
     state
         .metrics
         .active_requests
@@ -469,7 +528,6 @@ pub async fn chat_completions(
         .active_streams
         .fetch_add(1, Ordering::Relaxed);
 
-    // ⭐ 同样传 estimated_prompt 作为第 5 参数
     let tracker = Arc::new(TrackerState::new(
         Instant::now(),
         model_for_metrics,
@@ -485,12 +543,10 @@ pub async fn chat_completions(
     let stream = resp.bytes_stream().map(move |result| {
         if let Ok(ref chunk) = result {
             let mut buf = buf_for_stream.lock().unwrap();
-            // 尝试提取 usage
             if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut buf) {
                 *tracker_for_stream.usage.lock().unwrap() = Some(u);
             }
 
-            // 累加 SSE content 字符数（fallback）
             if let Ok(text) = std::str::from_utf8(chunk) {
                 for line in text.lines() {
                     let line = line.trim();
