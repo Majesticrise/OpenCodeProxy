@@ -3,9 +3,9 @@ mod handlers;
 mod logger;
 mod metrics;
 mod middleware;
+mod opencode_identity;
 mod proxy;
 mod state;
-mod opencode_identity;
 use dashmap::DashMap;
 
 use crate::{
@@ -92,15 +92,12 @@ async fn main() {
         upstream_models: Arc::new(RwLock::new(Default::default())),
     };
 
+    // ⚠️ 每个 (路径, 方法) 只出现一次，否则 axum 会 panic
     let app = Router::new()
         // 静态资源与健康检查
         .route("/", get(handlers::root))
         .route("/static/*path", get(handlers::static_handler))
         .route("/health", get(handlers::health))
-        .route("/api/upstream/models", get(handlers::api_upstream_models))
-        .route("/api/upstream/refresh", post(handlers::api_upstream_refresh))
-        .route("/api/routing", get(handlers::api_get_routing).post(handlers::api_set_routing))
-
         // 状态与监控
         .route("/api/status", get(handlers::api_status))
         .route("/api/logs", get(handlers::api_logs))
