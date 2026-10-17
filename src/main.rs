@@ -8,6 +8,7 @@ mod state;
 use dashmap::DashMap;
 
 use crate::{
+    config::RoutingConfig,
     logger::{LogBuffer, LogLayer},
     metrics::MetricsStore,
     proxy::ProxyPool,
@@ -19,7 +20,12 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::{env, path::Path, sync::Arc, time::Duration};
+use std::{
+    env,
+    path::Path,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
 
@@ -31,7 +37,10 @@ async fn main() {
     // 终端输出走 fmt::layer，Web 缓冲走自定义 LogLayer
     let subscriber = tracing_subscriber::registry()
         .with(EnvFilter::new(filter))
-        .with(tracing_subscriber::fmt::layer().with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())),
+        )
         .with(LogLayer::new(log_buffer.clone()));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
@@ -39,6 +48,7 @@ async fn main() {
     info!("Zen Proxy (Rust version v1.2.6 - WebUI Integrated)");
     info!("============================================================");
 
+    // ── 代理池 ──
     let proxy_pool = ProxyPool::new(&config::PROXY_FILE);
     let pool_clone = proxy_pool.clone();
     tokio::spawn(async move {
@@ -58,24 +68,51 @@ async fn main() {
         }
     });
 
+    // ── 模型路由（从环境变量初始化，运行时可在 WebUI 修改） ──
+    let routing = RoutingConfig::from_env();
+    if routing.mapping.is_empty() {
+        info!("Routing: no rules configured, models will be passed through as-is.");
+    } else {
+        let keys: Vec<_> = routing.mapping.keys().cloned().collect();
+        info!(
+            "Routing: {} rule(s) loaded (fallback_chain={}), keys={:?}",
+            routing.mapping.len(),
+            routing.enable_fallback_chain,
+            keys,
+        );
+    }
+
     let state = AppState {
         pool: proxy_pool,
         log_buffer: log_buffer.clone(),
         metrics: Arc::new(MetricsStore::new()),
         client_cache: Arc::new(DashMap::new()),
+        routing: Arc::new(RwLock::new(routing)),
+        upstream_models: Arc::new(RwLock::new(Default::default())),
     };
 
     let app = Router::new()
+        // 静态资源与健康检查
         .route("/", get(handlers::root))
         .route("/static/*path", get(handlers::static_handler))
         .route("/health", get(handlers::health))
+        // 状态与监控
         .route("/api/status", get(handlers::api_status))
         .route("/api/logs", get(handlers::api_logs))
         .route("/api/metrics", get(handlers::api_metrics))
         .route("/api/toggle", post(handlers::api_toggle))
+        // 模型路由配置（GET 读 / POST 写）
+        .route(
+            "/api/routing",
+            get(handlers::api_get_routing).post(handlers::api_set_routing),
+        )
+        // 上游模型探测
+        .route("/api/upstream/models", get(handlers::api_upstream_models))
+        .route("/api/upstream/refresh", post(handlers::api_upstream_refresh))
+        // OpenAI 兼容端点
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
-        // 关键：用 crate 内部的 middleware 模块；axum 的 from_fn 通过别名调用
+        // 剥离 Authorization 头（crate 内部 middleware 模块）
         .layer(axum_middleware::from_fn(middleware::strip_auth_middleware))
         .with_state(state);
 

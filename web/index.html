@@ -8,7 +8,6 @@
 </head>
 <body>
     <div class="app">
-        <!-- 侧边栏 -->
         <aside class="sidebar">
             <div class="brand">
                 <div class="brand-logo">Z</div>
@@ -20,6 +19,7 @@
 
             <nav class="nav">
                 <a class="nav-item active" data-view="dashboard"><span>📊</span>总览</a>
+                <a class="nav-item" data-view="routing"><span>🧭</span>模型路由</a>
                 <a class="nav-item" data-view="logs"><span>📋</span>实时日志</a>
                 <a class="nav-item" data-view="playground"><span>🧪</span>Playground</a>
                 <a class="nav-item" data-view="config"><span>⚙️</span>配置</a>
@@ -30,7 +30,6 @@
             </div>
         </aside>
 
-        <!-- 主内容 -->
         <main class="main">
             <header class="topbar">
                 <div class="topbar-left">
@@ -44,7 +43,7 @@
             </header>
 
             <div class="content">
-                <!-- 仪表盘 -->
+                <!-- 总览 -->
                 <section class="view active" id="view-dashboard">
                     <div class="grid grid-4">
                         <div class="card metric">
@@ -65,7 +64,6 @@
                             <div class="metric-sub" id="m-active-streams">流式 0</div>
                         </div>
                     </div>
-
                     <div class="grid grid-2">
                         <div class="card">
                             <div class="card-title">Token 使用</div>
@@ -81,20 +79,61 @@
                             <div class="kv"><span>状态</span><span id="p-state">-</span></div>
                         </div>
                     </div>
-
                     <div class="card">
                         <div class="card-title">每分钟 Token 使用</div>
                         <canvas id="chartPerMinute" height="180"></canvas>
                     </div>
-
                     <div class="grid grid-2">
                         <div class="card">
-                            <div class="card-title">按模型统计 <span class="muted">(prompt / completion / total)</span></div>
+                            <div class="card-title">按模型统计</div>
                             <div id="modelList" class="list"><div class="empty">暂无数据</div></div>
                         </div>
                         <div class="card">
                             <div class="card-title">HTTP 状态分布</div>
                             <div id="statusList" class="list"><div class="empty">暂无数据</div></div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 模型路由 -->
+                <section class="view" id="view-routing">
+                    <div class="card">
+                        <div class="card-title">
+                            <span>上游可用模型</span>
+                            <span class="muted" id="upstreamMeta">未探测</span>
+                        </div>
+                        <div class="pg-row">
+                            <button class="btn btn-primary" id="btnProbe">🔄 刷新上游列表</button>
+                            <label class="checkbox"><input type="checkbox" id="enableFallback" checked /> 启用 fallback chain（模型不可用时自动切下一个候选）</label>
+                        </div>
+                        <div id="upstreamModels" class="model-chips"><div class="empty">点击"刷新上游列表"获取</div></div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title">路由规则</div>
+                        <p class="muted">
+                            左侧：客户端（VS Code / curl）请求的模型名 ·
+                            右侧：实际发给上游的模型候选列表，<strong>按优先级排序</strong>，用 <code>,</code> 分隔 ·
+                            key 填 <code>*</code> 表示兜底
+                        </p>
+                        <div class="table-wrap">
+                            <table class="route-table">
+                                <thead>
+                                    <tr>
+                                        <th>客户端模型名</th>
+                                        <th>上游候选（优先级从高到低）</th>
+                                        <th style="width: 60px">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="routeTableBody">
+                                    <!-- 动态填充 -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="pg-row" style="margin-top: 12px">
+                            <button class="btn btn-ghost" id="btnAddRule">+ 添加规则</button>
+                            <div class="spacer"></div>
+                            <button class="btn btn-primary" id="btnSaveRouting">💾 保存并生效</button>
                         </div>
                     </div>
                 </section>
@@ -133,7 +172,6 @@
                         </div>
                         <textarea id="pgInput" class="pg-input" placeholder="输入你的问题…"></textarea>
                     </div>
-
                     <div class="card">
                         <div class="card-title">响应</div>
                         <pre class="response" id="pgResponse"></pre>
@@ -150,13 +188,12 @@
                         <div class="kv"><span>代理文件</span><code>proxies.txt</code></div>
                         <div class="kv"><span>日志级别</span><code>info</code></div>
                     </div>
-
                     <div class="card">
                         <div class="card-title">客户端接入</div>
                         <ol class="steps">
                             <li>Base URL 替换为 <code>http://localhost:8910/v1</code></li>
                             <li>API Key 任意填写即可</li>
-                            <li>模型名填 <code>deepseek-v4-flash-free</code> 等</li>
+                            <li>模型名可在「模型路由」页里自定义</li>
                         </ol>
                     </div>
                 </section>

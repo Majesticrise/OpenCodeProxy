@@ -498,3 +498,118 @@ select:focus { border-color: var(--accent); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+/* ────────── 模型路由 ────────── */
+
+.model-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+}
+.model-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--border-2);
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.model-chip:hover { background: var(--bg-3); color: var(--text); }
+.model-chip.selected { border-color: var(--accent); color: var(--text); background: rgba(91,141,239,0.15); }
+.model-chip .chip-tag {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--bg-3);
+    color: var(--text-mute);
+}
+
+.table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-top: 10px;
+}
+.route-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.route-table thead th {
+    text-align: left;
+    padding: 10px 12px;
+    background: var(--bg-2);
+    color: var(--text-dim);
+    font-weight: 500;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+}
+.route-table tbody td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+}
+.route-table tbody tr:last-child td { border-bottom: none; }
+.route-table tbody tr:hover { background: var(--bg-2); }
+
+.route-table input[type="text"] {
+    width: 100%;
+    background: var(--bg-3);
+    border: 1px solid var(--border-2);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 6px 9px;
+    font-size: 12.5px;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    outline: none;
+}
+.route-table input[type="text"]:focus { border-color: var(--accent); }
+
+.route-table .row-del {
+    background: transparent;
+    border: 1px solid var(--border-2);
+    color: var(--text-mute);
+    border-radius: 4px;
+    padding: 4px 8px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.route-table .row-del:hover { color: var(--red); border-color: var(--red); }
+
+.key-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--bg-3);
+    color: var(--accent-2);
+    font-size: 11px;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    margin-left: 4px;
+}
+
+.toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 10px 16px;
+    border-radius: 6px;
+    background: var(--bg-3);
+    color: var(--text);
+    font-size: 13px;
+    border: 1px solid var(--border-2);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.2s, transform 0.2s;
+    pointer-events: none;
+    z-index: 9999;
+}
+.toast.show { opacity: 1; transform: none; }
+.toast.ok { border-color: var(--green); }
+.toast.err { border-color: var(--red); }
