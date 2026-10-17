@@ -296,7 +296,7 @@ impl ProxyPool {
 
 // ── Web 路由处理 ──────────────────────────────────────────────────────
 async fn root() -> impl IntoResponse {
-    Html(include_str!("web/index.html"))
+    Html(include_str!("../web/index.html"))
 }
 
 async fn static_handler(uri: Uri) -> impl IntoResponse {
@@ -304,12 +304,12 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     match path {
         "style.css" => (
             [(axum::http::header::CONTENT_TYPE, "text/css")],
-            include_str!("web/style.css"),
+            include_str!("../web/style.css"),
         )
             .into_response(),
         "app.js" => (
             [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-            include_str!("web/app.js"),
+            include_str!("../web/app.js"),
         )
             .into_response(),
         _ => (StatusCode::NOT_FOUND, "Not Found").into_response(),
