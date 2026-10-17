@@ -2,7 +2,7 @@ use std::{collections::HashMap, env};
 use serde::{Deserialize, Serialize};
 
 lazy_static::lazy_static! {
-    /// 免费层走 /inference/v1（2026-10-14 之后）
+    /// 免费层走 /inference/openai/v1（2026-10-14 之后）
     pub static ref ZEN_UPSTREAM: String =
         env::var("ZEN_UPSTREAM").unwrap_or_else(|_| "https://opencode.ai/inference/openai/v1".to_string());
     pub static ref LISTEN_HOST: String =
