@@ -14,7 +14,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     if let Some(list) = routing.mapping.get(requested) {
@@ -294,7 +294,7 @@ pub async fn chat_completions(
 
         let builder = builder.header("Accept", "text/event-stream");
 
-        info!(
+        debug!(
             "attempt {}/{} model={} proxy={:?} session={} request={}",
             attempt + 1,
             max_retries,
@@ -306,7 +306,7 @@ pub async fn chat_completions(
 
         match builder.json(&forward_body).send().await {
             Err(e) => {
-                warn!("Proxy {:?} connection failed: {}. Retrying...", proxy, e);
+                debug!("Proxy {:?} connection failed: {}. Retrying...", proxy, e);
                 if let Some(ref p) = proxy {
                     state.pool.report_failure(p).await;
                 }

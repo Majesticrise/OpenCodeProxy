@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const COOLDOWN_RATE_LIMIT: Duration = Duration::from_secs(30);
 const COOLDOWN_CONNECTION: Duration = Duration::from_secs(300);
@@ -366,7 +366,7 @@ impl ProxyPool {
                     inner.proxies.len()
                 );
             } else {
-                warn!(
+                debug!(
                     "Proxy {} marked as {}, cooldown {:?}",
                     proxy_url, label, cooldown
                 );
