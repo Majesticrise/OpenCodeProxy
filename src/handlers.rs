@@ -16,7 +16,6 @@ use tracing::{error, info, warn};
 
 // ───────────────────────── 通用辅助 ─────────────────────────
 
-/// 按代理 URL 取或建 Client。代理为 None 时表示直连。
 async fn get_or_build_client(
     state: &AppState,
     proxy: &Option<String>,
@@ -42,7 +41,6 @@ async fn get_or_build_client(
     Ok(c)
 }
 
-/// 从未尝试过的代理里抽一个；最多重抽 16 次，避免池内全试过时死循环。
 async fn pick_unused_proxy(
     state: &AppState,
     tried: &std::collections::HashSet<String>,
@@ -90,7 +88,6 @@ pub async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     let pool_size = inner.proxies.len();
     let running = inner.is_running.load(Ordering::Relaxed);
     let avg_latency = if pool_size > 0 {
-        // 只统计未处于冷却期的节点，避免被拖低
         let now = std::time::Instant::now();
         let avail: Vec<&crate::proxy::ProxyEntry> = inner
             .proxies
@@ -138,6 +135,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn list_models() -> impl IntoResponse {
+    // ⚠️ 这份列表必须与上游 /v1/models 保持一致
+    // 上游换模型时，这里也要同步更新
     let models = vec![
         json!({"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "deepseek"}),
         json!({"id": "big-pickle", "object": "model", "owned_by": "opencode"}),
@@ -197,7 +196,6 @@ pub async fn chat_completions(
         model
     );
 
-    // 累计计数不需要回滚，放这里即可
     state
         .pool
         .inner
@@ -218,11 +216,13 @@ pub async fn chat_completions(
     let mut last_proxy: Option<String> = None;
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // 用于去重：记录第一个由代理返回的"可能是代理侧"的 4xx/5xx 错误
+    // 若下一个代理返回完全相同的 (status, body)，说明不是代理问题
+    let mut first_upstream_error: Option<(u16, Vec<u8>)> = None;
+
     for attempt in 0..max_retries {
-        // 选一个未试过的代理
         let proxy = pick_unused_proxy(&state, &tried).await;
 
-        // 池空时 attempt=0 允许直连一次；attempt>0 且仍无新代理则跳出
         if proxy.is_none() && attempt > 0 {
             break;
         }
@@ -238,7 +238,6 @@ pub async fn chat_completions(
             proxy
         );
 
-        // 取或建 client
         let client = match get_or_build_client(&state, &proxy).await {
             Ok(c) => c,
             Err(e) => {
@@ -255,7 +254,7 @@ pub async fn chat_completions(
             .send()
             .await
         {
-            // 网络层错误：换代理重试
+            // 网络层错误
             Err(e) => {
                 warn!("Proxy {:?} connection failed: {}. Retrying...", proxy, e);
                 if let Some(ref p) = proxy {
@@ -265,7 +264,7 @@ pub async fn chat_completions(
                 continue;
             }
 
-            // 拿到 HTTP 响应
+            // 收到 HTTP 响应
             Ok(resp) => {
                 let code = resp.status().as_u16();
 
@@ -288,7 +287,7 @@ pub async fn chat_completions(
                     continue;
                 }
 
-                // 其他 4xx / 5xx：读 body 判断是否"换代理就能过"
+                // 其他 4xx / 5xx：读 body
                 let body_bytes = resp.bytes().await.unwrap_or_default();
                 let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
@@ -300,6 +299,36 @@ pub async fn chat_completions(
                     || code >= 500;
 
                 if looks_proxy_related {
+                    // ⭐ 关键：判断是否与上一个代理返回完全相同
+                    let is_same_as_first = first_upstream_error
+                        .as_ref()
+                        .map(|(c, b)| *c == code && b.as_slice() == body_bytes.as_slice())
+                        .unwrap_or(false);
+
+                    if is_same_as_first {
+                        warn!(
+                            "Upstream returned identical {} from multiple proxies ({}). \
+                             This is NOT a proxy issue — returning immediately.",
+                            code,
+                            body_str.chars().take(160).collect::<String>()
+                        );
+                        // 该代理也标记失败（它确实没帮上忙）
+                        if let Some(ref p) = proxy {
+                            state.pool.report_failure(p).await;
+                        }
+                        return Response::builder()
+                            .status(code)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body_bytes))
+                            .unwrap()
+                            .into_response();
+                    }
+
+                    // 第一次遇到：记下来，冷却重试
+                    if first_upstream_error.is_none() {
+                        first_upstream_error = Some((code, body_bytes.clone()));
+                    }
+
                     warn!(
                         "Proxy {:?} got {} ({}). Treating as proxy-side failure, retrying…",
                         proxy,
@@ -313,7 +342,7 @@ pub async fn chat_completions(
                     continue;
                 }
 
-                // 真正属于请求本身的错（模型名错、schema 错等）：原样透传，不再重试
+                // 请求本身的问题（模型名错、schema 错）：直接返回，不重试
                 warn!("Upstream returned {} (non-retryable): {}", code, body_str);
                 return Response::builder()
                     .status(code)
@@ -330,6 +359,9 @@ pub async fn chat_completions(
         Some(r) => r,
         None => {
             warn!("All proxies failed. Falling back to direct connection.");
+            // ⭐ 修正：直连时清空 last_proxy，避免日志误导
+            last_proxy = None;
+
             let client = match get_or_build_client(&state, &None).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -360,7 +392,7 @@ pub async fn chat_completions(
         }
     };
 
-    // ── 6. 构造响应头（过滤 hop-by-hop 与长度相关头） ──
+    // ── 6. 构造响应头 ──
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut headers = HeaderMap::new();
     for (key, value) in resp.headers().iter() {
@@ -383,7 +415,7 @@ pub async fn chat_completions(
 
     info!("  ← status={} (routed via: {:?})", status, last_proxy);
 
-    // ── 7. 非流式分支：聚合整段 body，避免 chunked 传输 ──
+    // ── 7. 非流式分支 ──
     if !is_stream {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
@@ -393,7 +425,6 @@ pub async fn chat_completions(
             }
         };
 
-        // 确定要返回成功响应了，才递增活跃计数（与 Guard 同事务）
         state.metrics.active_requests.fetch_add(1, Ordering::Relaxed);
 
         let tracker = Arc::new(TrackerState {
@@ -409,7 +440,6 @@ pub async fn chat_completions(
             *tracker.usage.lock().unwrap() = Some(u);
         }
 
-        // 明确告知长度与类型，避免客户端拿到 chunked
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
@@ -442,7 +472,6 @@ pub async fn chat_completions(
         usage: Mutex::new(None),
     });
 
-    // usage 缓冲按字节累积，避免 UTF-8 边界截断
     let usage_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let tracker_for_stream = tracker.clone();
     let buf_for_stream = usage_buf.clone();
@@ -461,7 +490,6 @@ pub async fn chat_completions(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
 
-    // MetricsGuard 用 Arc 包装（Extensions::insert 要求 T: Clone）
     response
         .extensions_mut()
         .insert(Arc::new(MetricsGuard {
