@@ -164,9 +164,22 @@ impl ProxyPool {
         tokio::spawn(async move {
             info!("Fetching free proxy list from multiple public APIs...");
             let sources = vec![
+                // ── HTTP/HTTPS 代理 ──
                 "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all",
                 "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+                "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+                "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+                "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+                // ── SOCKS4 代理 ──
+                "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
+                "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+                // ── SOCKS5 代理（推荐，延迟更低） ──
+                "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+                "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+                "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+                // ── ProxyScrape 接口 ──
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all&ssl=all&anonymity=all",
             ];
 
             let mut raw_ips = HashSet::new();
@@ -212,13 +225,13 @@ impl ProxyPool {
     }
 
     async fn validate_proxies(&self, raw_proxies: Vec<String>) {
-        let sample_size = std::cmp::min(450, raw_proxies.len());
+        let sample_size = std::cmp::min(3000, raw_proxies.len());
         let mut test_targets = raw_proxies;
         test_targets.shuffle(&mut rand::thread_rng());
         test_targets.truncate(sample_size);
 
         let mut tasks = Vec::new();
-        let sem = Arc::new(tokio::sync::Semaphore::new(75));
+        let sem = Arc::new(tokio::sync::Semaphore::new(200));
 
         for proxy in test_targets {
             let sem_clone = sem.clone();
@@ -247,7 +260,7 @@ impl ProxyPool {
             }
         }
         validated.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        validated.truncate(40);
+        validated.truncate(100);
 
         let mut inner = self.inner.write().await;
         inner.proxies = validated.clone();
