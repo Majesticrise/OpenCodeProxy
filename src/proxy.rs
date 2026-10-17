@@ -1,4 +1,4 @@
-use crate::config::{MIN_POOL_SIZE, PROXY_FILE, VALIDATE_TARGET};
+use crate::config::{MIN_POOL_SIZE, VALIDATE_TARGET};
 use futures_util::stream::{self, StreamExt};
 use rand::seq::SliceRandom;
 use std::{

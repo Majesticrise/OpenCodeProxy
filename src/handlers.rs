@@ -314,11 +314,16 @@ pub async fn chat_completions(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
 
-    // 将 Guard 塞进 response.extensions，响应被 drop（=流完全结束）时自动记录
-    response.extensions_mut().insert(MetricsGuard {
+    // ── 将 Guard 通过 Arc 塞进 response.extensions ──
+    // http 1.5+ 的 Extensions::insert 要求 T: Clone + Send + Sync + 'static。
+    // MetricsGuard 实现了 Drop（用于在响应 drop 时记录指标并减计数），
+    // 如果给它 derive(Clone)，克隆副本析构时会重复触发 Drop，导致计数错乱。
+    // 因此这里用 Arc 包装：Arc<MetricsGuard> 天然 Clone，
+    // 且只有最后一个强引用被释放时才会真正 drop 内部的 MetricsGuard。
+    response.extensions_mut().insert(Arc::new(MetricsGuard {
         metrics: state.metrics.clone(),
         tracker,
-    });
+    }));
 
     response
 }

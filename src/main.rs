@@ -13,13 +13,14 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    middleware,
+    // 重命名导入，避免与 crate 内的 `mod middleware` 冲突
+    middleware as axum_middleware,
     routing::{get, post},
     Router,
 };
 use std::{env, path::Path, sync::Arc, time::Duration};
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
 
 #[tokio::main]
 async fn main() {
@@ -29,11 +30,7 @@ async fn main() {
     // 终端输出走 fmt::layer，Web 缓冲走自定义 LogLayer
     let subscriber = tracing_subscriber::registry()
         .with(EnvFilter::new(filter))
-        .with(
-            tracing_subscriber::fmt::layer()
-                // 容器 / 日志采集环境建议关闭 ANSI 颜色
-                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())),
-        )
+        .with(tracing_subscriber::fmt::layer().with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())))
         .with(LogLayer::new(log_buffer.clone()));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
@@ -76,7 +73,8 @@ async fn main() {
         .route("/api/toggle", post(handlers::api_toggle))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
-        .layer(middleware::from_fn(middleware::strip_auth_middleware))
+        // 关键：用 crate 内部的 middleware 模块；axum 的 from_fn 通过别名调用
+        .layer(axum_middleware::from_fn(middleware::strip_auth_middleware))
         .with_state(state);
 
     let addr = format!("{}:{}", *config::LISTEN_HOST, *config::LISTEN_PORT);
