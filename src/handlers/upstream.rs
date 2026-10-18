@@ -7,8 +7,8 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-fn impersonate() -> wreq_util::Emulation {
-    wreq_util::Emulation::Chrome131
+fn impersonate() -> wreq_util::Profile {
+    wreq_util::Profile::Chrome131
 }
 
 async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), String> {

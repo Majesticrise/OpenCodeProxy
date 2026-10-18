@@ -13,8 +13,8 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
-fn impersonate() -> wreq_util::Emulation {
-    wreq_util::Emulation::Chrome131
+fn impersonate() -> wreq_util::Profile {
+    wreq_util::Profile::Chrome131
 }
 
 fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
