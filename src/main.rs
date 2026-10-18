@@ -70,7 +70,7 @@ async fn main() {
     });
 
     // ── 模型路由（从环境变量初始化，运行时可在 WebUI 修改） ──
-    let routing = RoutingConfig::from_env();
+    let routing = RoutingConfig::from_file_or_env();
     if routing.mapping.is_empty() {
         info!("Routing: no rules configured, models will be passed through as-is.");
     } else {

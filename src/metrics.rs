@@ -174,11 +174,24 @@ impl MetricsStore {
             t.updated_at_secs = now_secs();
             t.clone()
         };
-        if let Ok(json) = serde_json::to_string_pretty(&totals) {
-            if let Err(e) = std::fs::write(path, json) {
-                warn!("Failed to persist metrics totals: {}", e);
+        let json = match serde_json::to_string_pretty(&totals) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to serialize metrics totals: {}", e);
                 self.dirty.store(true, Ordering::Relaxed);
+                return;
             }
+        };
+        // ⭐ 用 tmp + rename 保证原子性
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json) {
+            warn!("Failed to write metrics tmp file: {}", e);
+            self.dirty.store(true, Ordering::Relaxed);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!("Failed to rename metrics tmp file: {}", e);
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 

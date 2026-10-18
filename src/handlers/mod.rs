@@ -49,11 +49,19 @@ pub async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     let running = inner.is_running.load(Ordering::Relaxed);
     let avg_latency = if pool_size > 0 {
         let now = std::time::Instant::now();
-        let avail: Vec<_> = inner.proxies.iter().filter(|p| p.available(now)).collect();
-        if avail.is_empty() { 0.0 } else {
+        let avail: Vec<_> = inner
+            .proxies
+            .iter()
+            .filter(|p| p.available(now) && p.latency > 0.0)
+            .collect();
+        if avail.is_empty() {
+            0.0
+        } else {
             avail.iter().map(|p| p.latency).sum::<f64>() / avail.len() as f64
         }
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let total_requests = inner.total_requests.load(Ordering::Relaxed);
     drop(inner);
     let fetching = state.pool.is_fetching.load(Ordering::Relaxed);

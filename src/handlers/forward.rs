@@ -86,6 +86,12 @@ async fn pick_unused_proxy(
     None
 }
 
+/// ⭐ 修复 P1-1：断流时不再返回 502，而是把已收到的内容打包返回。
+///
+/// 行为对比：
+/// - 上游正常结束 → `finish_reason: "stop"`，返回完整内容
+/// - 上游中途断流 + 已收到部分内容 → `finish_reason: "length"`，返回部分内容
+/// - 上游在第一个字节前就断流 → 返回 Err（调用方转 502，与流式分支发 error event 的行为对齐）
 async fn aggregate_sse_to_json(
     resp: reqwest::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
@@ -95,62 +101,79 @@ async fn aggregate_sse_to_json(
     let mut usage: Option<crate::metrics::UsageInfo> = None;
     let mut id = String::new();
     let mut model = String::new();
+    let mut broke_midway = false;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("stream error: {}", e))?;
-        buf.extend_from_slice(&chunk);
+    loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                buf.extend_from_slice(&chunk);
 
-        let mut start = 0;
-        while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
-            let end = start + pos;
-            let line = String::from_utf8_lossy(&buf[start..end]).to_string();
-            start = end + 1;
-            let line = line.trim();
-            let json_str = if let Some(s) = line.strip_prefix("data:") {
-                s.trim_start()
-            } else {
-                continue;
-            };
-            if json_str.is_empty() || json_str == "[DONE]" {
-                continue;
+                let mut start = 0;
+                while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
+                    let end = start + pos;
+                    let line = String::from_utf8_lossy(&buf[start..end]).to_string();
+                    start = end + 1;
+                    let line = line.trim();
+                    let json_str = if let Some(s) = line.strip_prefix("data:") {
+                        s.trim_start()
+                    } else {
+                        continue;
+                    };
+                    if json_str.is_empty() || json_str == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if id.is_empty() {
+                            if let Some(i) = v.get("id").and_then(|i| i.as_str()) {
+                                id = i.to_string();
+                            }
+                        }
+                        if model.is_empty() {
+                            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                                model = m.to_string();
+                            }
+                        }
+                        if let Some(u) = v.get("usage") {
+                            if !u.is_null() {
+                                usage = Some(crate::metrics::UsageInfo::from_json(u));
+                            }
+                        }
+                        if let Some(delta) = v
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|c| c.get("delta"))
+                            .and_then(|d| d.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            content.push_str(delta);
+                        }
+                    }
+                }
+                if start > 0 {
+                    buf.drain(..start);
+                }
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if id.is_empty() {
-                    if let Some(i) = v.get("id").and_then(|i| i.as_str()) {
-                        id = i.to_string();
-                    }
-                }
-                if model.is_empty() {
-                    if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
-                        model = m.to_string();
-                    }
-                }
-                if let Some(u) = v.get("usage") {
-                    if !u.is_null() {
-                        usage = Some(crate::metrics::UsageInfo::from_json(u));
-                    }
-                }
-                if let Some(delta) = v
-                    .get("choices")
-                    .and_then(|c| c.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    content.push_str(delta);
-                }
+            Some(Err(e)) => {
+                warn!("Non-stream aggregation: upstream broke mid-way: {}", e);
+                broke_midway = true;
+                break;
             }
+            None => break,
         }
-        if start > 0 {
-            buf.drain(..start);
-        }
+    }
+
+    // 一个字节的内容都没收到就失败 → 跟流式分支的 "error event" 对齐，返回 Err 让调用方转 502
+    if broke_midway && content.is_empty() && id.is_empty() {
+        return Err("upstream stream broke before any data".to_string());
     }
 
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    let finish_reason = if broke_midway { "length" } else { "stop" };
 
     let response_json = json!({
         "id": if id.is_empty() { format!("chatcmpl-{}", created) } else { id },
@@ -160,7 +183,7 @@ async fn aggregate_sse_to_json(
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": content },
-            "finish_reason": "stop"
+            "finish_reason": finish_reason
         }],
         "usage": usage
     });
@@ -365,6 +388,7 @@ pub async fn chat_completions(
                     || body_str.contains("too many requests")
                     || body_str.contains("forbidden")
                     || body_str.contains("blocked")
+                    || code == 408
                     || code >= 500;
 
                 if looks_proxy_related {

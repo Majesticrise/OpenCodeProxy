@@ -252,8 +252,11 @@ function drawChart() {
 
 // ── 日志 ──
 function parseLogLine(line) {
-    const m = line.match(/^\[(\s*\d+\.\d+)\]\s+\[\s*(\w+)\]\s+([\s\S]*)$/);
-    if (m) return { ts: m[1].trim(), level: m[2].toUpperCase(), msg: m[3] };
+    // 新格式：[2026-10-18 06:30:15.678] [ INFO] message
+    const m = line.match(/^\[([\d\- :\.]+)\]\s+\[\s*(\w+)\]\s+([\s\S]*)$/);
+    if (m) {
+        return { ts: m[1].trim(), level: m[2].toUpperCase(), msg: m[3] };
+    }
     return { ts: '', level: 'INFO', msg: line };
 }
 

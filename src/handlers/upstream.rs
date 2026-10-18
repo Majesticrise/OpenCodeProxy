@@ -1,5 +1,5 @@
 use crate::{
-    config::{OPENCODE_UA, ZEN_UPSTREAM},
+    config::{OPENCODE_UA, VALIDATE_TARGET},
     state::{AppState, UpstreamCache},
 };
 use axum::{extract::State, response::IntoResponse, Json};
@@ -7,8 +7,9 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+
 async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), String> {
-    let url = format!("{}/models", *ZEN_UPSTREAM);
+    let url = VALIDATE_TARGET.clone();
     // 部分时期上游对 /models 也校验 UA，跟着 CLI 一起伪装
     let ua = OPENCODE_UA.as_str();
 
@@ -25,7 +26,7 @@ async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), Strin
                 }
             }
         }
-        Ok(r) => return Err(format!("direct returned {}", r.status())),
+        Ok(r) => warn!("Direct probe returned {}; trying proxies", r.status()),
         Err(e) => warn!("Direct probe failed: {}", e),
     }
 

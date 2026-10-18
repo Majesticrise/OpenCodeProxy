@@ -2,7 +2,7 @@ use crate::config::{MIN_POOL_SIZE, VALIDATE_TARGET};
 use futures_util::stream::{self, StreamExt};
 use rand::seq::SliceRandom;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,7 +17,9 @@ const COOLDOWN_RATE_LIMIT: Duration = Duration::from_secs(30);
 const COOLDOWN_CONNECTION: Duration = Duration::from_secs(300);
 /// 403 FreeTierError 冷却（比连接错误略短，给 IP 信誉恢复留窗口）
 const COOLDOWN_BANNED: Duration = Duration::from_secs(900);
-const MAX_FAILS_BEFORE_REMOVE: u32 = 3;
+
+
+const MAX_FAILS_BEFORE_REMOVE: u32 = 5;
 
 #[derive(Clone)]
 pub struct ProxyEntry {
@@ -170,6 +172,8 @@ impl ProxyPool {
             let _reset = FetchingReset(self_clone.is_fetching.clone());
 
             info!("Fetching free proxy list from multiple public APIs...");
+
+            // ⭐ 修改：移除 proxyscrape.com 两个源（在当前网络下从未成功过）
             let sources = vec![
                 "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
                 "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
@@ -181,8 +185,6 @@ impl ProxyPool {
                 "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
                 "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
                 "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all&ssl=all&anonymity=all",
             ];
 
             let mut raw_ips = HashSet::new();
@@ -225,6 +227,15 @@ impl ProxyPool {
         });
     }
 
+    /// ⭐ 重写：合并语义替代全量覆盖
+    ///
+    /// 旧逻辑：每次 fetch 后 `inner.proxies = validated`，把实战积累的
+    ///        fail_count / last_success / cooldown_until 全部清零。
+    ///
+    /// 新逻辑：
+    ///   1. 新通过验证的代理 → 复用旧 entry（保留 fail_count 等），只更新 latency
+    ///   2. 本次验证未覆盖但曾经成功过（last_success.is_some）的代理 → 保留
+    ///   3. 持久化只写当前 `available` 的代理（避免重启后立刻踩冷却）
     async fn validate_proxies(&self, raw_proxies: Vec<String>) {
         let sample_size = std::cmp::min(7000, raw_proxies.len());
         let mut test_targets = raw_proxies;
@@ -247,7 +258,8 @@ impl ProxyPool {
                     .build()
                     .ok()?;
                 match client.get(&target).send().await {
-                    Ok(resp) if resp.status() == 200 => {
+                    // 上游 /models 是 200；某些镜像可能给 204 或 3xx
+                    Ok(resp) if resp.status().is_success() => {
                         Some((proxy, start.elapsed().as_secs_f64()))
                     }
                     _ => None,
@@ -265,35 +277,86 @@ impl ProxyPool {
         validated.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         validated.truncate(100);
 
+        // ── 合并到内存池 ──
+        let mut inner = self.inner.write().await;
+        let now = Instant::now();
+
+        // 1) 把现有池子抽出来（按 url 建索引）
+        let existing: HashMap<String, ProxyEntry> = inner
+            .proxies
+            .drain(..)
+            .map(|p| (p.url.clone(), p))
+            .collect();
+
+        // 2) 新验证通过的代理：复用旧 entry 的 fail_count / last_success / cooldown
+        let mut merged: Vec<ProxyEntry> = Vec::new();
+        let mut merged_urls: HashSet<String> = HashSet::new();
+
+        for (url, lat) in validated.iter() {
+            let entry = match existing.get(url).cloned() {
+                Some(mut old) => {
+                    old.latency = *lat;
+                    old
+                }
+                None => ProxyEntry::new(url.clone(), *lat),
+            };
+            merged_urls.insert(url.clone());
+            merged.push(entry);
+        }
+
+        // 3) 本次验证没覆盖、但历史上成功过的代理：保留（可能在冷却中）
+        for (url, entry) in existing {
+            if merged_urls.contains(&url) {
+                continue;
+            }
+            if entry.last_success.is_some() || entry.fail_count == 0 {
+                merged.push(entry);
+            }
+        }
+
+        let merged_count = merged.len();
+        let available_count = merged.iter().filter(|p| p.available(now)).count();
+
+        // 4) 持久化：只写当前健康的（避免重启后立刻踩冷却）
+        let to_save: Vec<(String, f64)> = merged
+            .iter()
+            .filter(|p| p.available(now))
+            .map(|p| (p.url.clone(), p.latency))
+            .collect();
+
+        // 5) 写回池子
+        inner.proxies = merged;
+        drop(inner);
+
+        // ── 日志 & 持久化 ──
         if !validated.is_empty() {
             info!(
-                "Proxy pool updated: {} high-speed verified proxies ready. (Fastest: {:.2}s)",
+                "Proxy pool updated: {} validated, {} total ({} available), fastest {:.2}s",
                 validated.len(),
+                merged_count,
+                available_count,
                 validated[0].1
             );
+        } else if merged_count > 0 {
+            warn!(
+                "No proxies passed validation this round. Preserved {} historical proxies.",
+                merged_count
+            );
+        } else {
+            warn!("No proxies passed validation and no history to preserve. Pool empty.");
+        }
 
-            let to_save: Vec<(String, f64)> =
-                validated.iter().map(|(u, l)| (u.clone(), *l)).collect();
+        if !to_save.is_empty() {
             match serde_json::to_string_pretty(&to_save) {
                 Ok(json_str) => {
                     if let Err(e) = tokio::fs::write("verified_proxies.json", json_str).await {
                         warn!("Failed to persist proxy pool: {}", e);
                     } else {
-                        info!("Proxy pool persisted to verified_proxies.json");
+                        debug!("Proxy pool persisted to verified_proxies.json");
                     }
                 }
                 Err(e) => warn!("Failed to serialize proxy pool: {}", e),
             }
-
-            let mut inner = self.inner.write().await;
-            inner.proxies = validated
-                .into_iter()
-                .map(|(url, lat)| ProxyEntry::new(url, lat))
-                .collect();
-        } else {
-            warn!("No proxies passed the high-speed check (under 5s). Pool empty.");
-            let mut inner = self.inner.write().await;
-            inner.proxies.clear();
         }
     }
 

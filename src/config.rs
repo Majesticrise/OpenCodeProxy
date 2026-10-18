@@ -14,11 +14,15 @@ lazy_static::lazy_static! {
     pub static ref PROXY_FILE: String =
         env::var("PROXY_FILE").unwrap_or_else(|_| "proxies.txt".to_string());
     pub static ref VALIDATE_TARGET: String =
-        env::var("VALIDATE_TARGET").unwrap_or_else(|_| "https://opencode.ai".to_string());
+        env::var("VALIDATE_TARGET")
+            .unwrap_or_else(|_| "https://opencode.ai/zen/v1/models".to_string());
     pub static ref MIN_POOL_SIZE: usize =
         env::var("MIN_POOL_SIZE").unwrap_or_else(|_| "10".to_string()).parse().unwrap_or(10);
     pub static ref LOG_BUFFER_CAP: usize =
         env::var("LOG_BUFFER_CAP").unwrap_or_else(|_| "500".to_string()).parse().unwrap_or(500);
+
+    pub static ref ROUTING_FILE: String =
+        env::var("ROUTING_FILE").unwrap_or_else(|_| "routing.json".to_string());
 
     /// OpenCode CLI 的 User-Agent，版本必须 >= 1.18.0
     /// 默认值来自抓包真实客户端
@@ -88,5 +92,26 @@ impl RoutingConfig {
             }
         }
         Self { mapping, enable_fallback_chain: true }
+    }
+    // impl RoutingConfig 里新增
+    pub fn from_file_or_env() -> Self {
+        let path = &*crate::config::ROUTING_FILE;
+        if let Ok(content) = std::fs::read_to_string(path) {
+            match serde_json::from_str::<RoutingConfig>(&content) {
+                Ok(cfg) => {
+                    tracing::info!(
+                        "Loaded routing config from {} ({} rules, fallback={})",
+                        path,
+                        cfg.mapping.len(),
+                        cfg.enable_fallback_chain
+                    );
+                    return cfg;
+                }
+                Err(e) => {
+                    tracing::warn!("Corrupt routing config at {}: {}; using env", path, e);
+                }
+            }
+        }
+        Self::from_env()
     }
 }

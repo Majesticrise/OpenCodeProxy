@@ -60,19 +60,68 @@ impl<S: Subscriber> Layer<S> for LogLayer {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        // 与 fmt::layer 默认毫秒精度对齐
-        let secs = now.as_secs() % 100_000; // 保留后 5 位，避免过长
-        let millis = now.subsec_millis();
 
         let line = format!(
-            "[{:>5}.{:03}] [{:>5}] {}",
-            secs,
-            millis,
+            "[{}] [{:>5}] {}",
+            format_utc_with_millis(now.as_secs(), now.subsec_millis()),
             meta.level(),
             visitor.0
         );
         self.buffer.push(line);
     }
+}
+
+/// 把 Unix 秒数 + 毫秒转成 "YYYY-MM-DD HH:MM:SS.mmm" 格式（UTC）
+///
+/// 说明：使用 UTC 而非本地时间，因为：
+/// - 不依赖平台时区 API，跨平台一致
+/// - 容器部署时 UTC 是常见约定
+/// - 前端可以按需转换（在 WebUI 里加 `new Date(...).toLocaleString()` 等）
+fn format_utc_with_millis(unix_secs: u64, millis: u32) -> String {
+    let days = (unix_secs / 86400) as i64;
+    let mut secs_in_day = (unix_secs % 86400) as u32;
+
+    let hour = secs_in_day / 3600;
+    secs_in_day %= 3600;
+    let minute = secs_in_day / 60;
+    let second = secs_in_day % 60;
+
+    // 从 1970-01-01 开始逐年推进
+    let mut year = 1970i32;
+    let mut days_left = days;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days_left < days_in_year {
+            break;
+        }
+        days_left -= days_in_year;
+        year += 1;
+    }
+
+    // 从 1 月开始逐月推进
+    let month_days: [i64; 12] = [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut month = 1u32;
+    for &d in month_days.iter() {
+        if days_left < d {
+            break;
+        }
+        days_left -= d;
+        month += 1;
+    }
+    let day = (days_left + 1) as u32;
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        year, month, day, hour, minute, second, millis
+    )
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// 从 Event 中抽取 message 以及附加字段

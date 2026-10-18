@@ -396,7 +396,7 @@ body {
 .log-ts {
     color: var(--log-ts);
     flex-shrink: 0;
-    min-width: 68px;
+    min-width: 160px;
     font-variant-numeric: tabular-nums;
 }
 .log-level {
