@@ -8,13 +8,16 @@ use axum::{
 use futures_util::{stream, StreamExt};
 use serde_json::json;
 use std::{
-    sync::{
-        atomic::Ordering,
-        Arc, Mutex,
-    },
+    sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
+
+/// 统一的 impersonate 配置
+fn impersonate() -> rquest::impersonate::Impersonate {
+    use rquest::impersonate::Impersonate;
+    Impersonate::Chrome131
+}
 
 fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     if let Some(list) = routing.mapping.get(requested) {
@@ -53,17 +56,18 @@ fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
 async fn get_or_build_client(
     state: &AppState,
     proxy: &Option<String>,
-) -> Result<reqwest::Client, reqwest::Error> {
+) -> Result<rquest::Client, rquest::Error> {
     if let Some(c) = state.client_cache.get(proxy).map(|v| v.clone()) {
         return Ok(c);
     }
-    let mut b = reqwest::Client::builder()
+    let mut b = rquest::Client::builder()
+        .impersonate(impersonate())
         .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_millis(2500))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8);
     if let Some(p) = proxy {
-        if let Ok(rp) = reqwest::Proxy::all(p) {
+        if let Ok(rp) = rquest::Proxy::all(p) {
             b = b.proxy(rp);
         }
     }
@@ -86,14 +90,9 @@ async fn pick_unused_proxy(
     None
 }
 
-/// ⭐ 修复 P1-1：断流时不再返回 502，而是把已收到的内容打包返回。
-///
-/// 行为对比：
-/// - 上游正常结束 → `finish_reason: "stop"`，返回完整内容
-/// - 上游中途断流 + 已收到部分内容 → `finish_reason: "length"`，返回部分内容
-/// - 上游在第一个字节前就断流 → 返回 Err（调用方转 502，与流式分支发 error event 的行为对齐）
+
 async fn aggregate_sse_to_json(
-    resp: reqwest::Response,
+    resp: rquest::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::<u8>::new();
@@ -268,7 +267,8 @@ pub async fn chat_completions(
 
     let model_for_metrics = requested_model.clone();
     let max_retries = 8usize;
-    let mut target_resp: Option<reqwest::Response> = None;
+    // ⭐ 类型改成 rquest::Response
+    let mut target_resp: Option<rquest::Response> = None;
     let mut last_proxy: Option<String> = None;
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidate_idx = 0usize;
@@ -296,7 +296,7 @@ pub async fn chat_completions(
         let client = match get_or_build_client(&state, &proxy).await {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to build reqwest client: {}", e);
+                error!("Failed to build rquest client: {}", e);
                 continue;
             }
         };

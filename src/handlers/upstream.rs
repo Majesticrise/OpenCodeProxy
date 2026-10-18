@@ -7,14 +7,19 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+/// 统一的 impersonate 配置
+fn impersonate() -> rquest::impersonate::Impersonate {
+    use rquest::impersonate::Impersonate;
+    Impersonate::Chrome131
+}
 
 async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), String> {
     let url = VALIDATE_TARGET.clone();
-    // 部分时期上游对 /models 也校验 UA，跟着 CLI 一起伪装
     let ua = OPENCODE_UA.as_str();
 
-    // 直连
-    let direct = reqwest::Client::builder()
+    // 直连：加 impersonate
+    let direct = rquest::Client::builder()
+        .impersonate(impersonate())
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -30,13 +35,15 @@ async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), Strin
         Err(e) => warn!("Direct probe failed: {}", e),
     }
 
-    // 代理兜底
+    // 代理兜底：加 impersonate
     for _ in 0..3 {
         let Some(proxy) = state.pool.get_proxy().await else {
             break;
         };
-        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(8));
-        if let Ok(rp) = reqwest::Proxy::all(&proxy) {
+        let mut b = rquest::Client::builder()
+            .impersonate(impersonate())
+            .timeout(Duration::from_secs(8));
+        if let Ok(rp) = rquest::Proxy::all(&proxy) {
             b = b.proxy(rp);
         }
         let Ok(c) = b.build() else {

@@ -8,10 +8,8 @@ use std::{
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// 官方 6 大核心工具（字母序）
 const OFFICIAL_TOOLS: [&str; 6] = ["bash", "edit", "glob", "grep", "read", "write"];
 
-/// 每个工具的最小非空 schema
 fn official_tool_schema(name: &str) -> serde_json::Value {
     match name {
         "bash" => serde_json::json!({
@@ -73,7 +71,6 @@ fn tool_description(name: &str) -> &'static str {
 
 /// 对齐 OpenCode CLI Identifier.descending("ses")
 /// 格式：ses_ + 12位hex + 14位Base62，总长30
-/// ⭐ 关键：counter 必须限制在 0–63，确保 12 位 hex 的末三位落在 fc0–fff
 pub fn generate_session_id() -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -90,7 +87,6 @@ pub fn generate_session_id() -> String {
     format!("ses_{}{}", hex_full, suffix)
 }
 
-/// 升序消息 ID，前缀 msg_
 pub fn generate_request_id() -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -106,13 +102,7 @@ pub fn generate_request_id() -> String {
     format!("msg_{}{}", hex_full, suffix)
 }
 
-/// 向请求体注入免费层工具契约。
-///
-/// 规则（2026-10-14 之后）：
-/// - tools 必须包含官方 6 大工具：bash, edit, glob, grep, read, write
-/// - 每个工具的 parameters 必须是非空 schema
-/// - 工具按字母序排列
-/// - tool_choice 必须为 "auto"
+// ⭐ 关键修复：补回丢失的函数头
 pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -122,7 +112,6 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         return;
     };
 
-    // 1) 收集客户端已传的工具名 → 工具对象
     let mut existing: HashMap<String, serde_json::Value> = HashMap::new();
     for t in arr.drain(..) {
         if let Some(name) = t
@@ -135,7 +124,6 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
-    // 2) 确保 6 大核心工具都在，且 parameters 非空
     for &name in &OFFICIAL_TOOLS {
         let entry = existing.entry(name.to_string()).or_insert_with(|| {
             serde_json::json!({
@@ -162,7 +150,6 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
-    // 3) 客户端额外传入的工具也修复空 schema
     for (name, entry) in existing.iter_mut() {
         if OFFICIAL_TOOLS.contains(&name.as_str()) {
             continue;
@@ -181,12 +168,10 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
-    // 4) 按字母序重排，写回 tools 数组
     let mut sorted: Vec<(String, serde_json::Value)> = existing.into_iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
     *arr = sorted.into_iter().map(|(_, v)| v).collect();
 
-    // 5) tool_choice 必须为 auto
     if let Some(obj) = body.as_object_mut() {
         obj.entry("tool_choice")
             .or_insert_with(|| serde_json::json!("auto"));
@@ -195,8 +180,8 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
 
 /// 构造请求头，返回 (builder, session_id, request_id) 供日志使用
 pub fn apply_headers(
-    builder: reqwest::RequestBuilder,
-) -> (reqwest::RequestBuilder, String, String) {
+    builder: rquest::RequestBuilder,
+) -> (rquest::RequestBuilder, String, String) {
     let session_id = generate_session_id();
     let request_id = generate_request_id();
     let builder = builder

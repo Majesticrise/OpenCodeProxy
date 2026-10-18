@@ -19,9 +19,14 @@ const COOLDOWN_BANNED: Duration = Duration::from_secs(900);
 const MAX_FAILS_BEFORE_REMOVE: u32 = 5;
 
 /// 每验证成功多少个代理就 flush 一批到池子
-const VALIDATION_BATCH_FLUSH: usize = 10;
+const VALIDATION_BATCH_FLUSH: usize = 5;
 /// 池子上限（按 latency 排序后保留前 N 个）
 const MAX_POOL_SIZE: usize = 100;
+
+fn impersonate() -> rquest::impersonate::Impersonate {
+    use rquest::impersonate::Impersonate;
+    Impersonate::Chrome131
+}
 
 #[derive(Clone)]
 pub struct ProxyEntry {
@@ -188,7 +193,8 @@ impl ProxyPool {
             ];
 
             let mut raw_ips = HashSet::new();
-            let client = reqwest::Client::builder()
+            let client = rquest::Client::builder()
+                .impersonate(impersonate())
                 .timeout(Duration::from_secs(8))
                 .build()
                 .unwrap();
@@ -268,8 +274,9 @@ impl ProxyPool {
             async move {
                 let _permit = sem.acquire().await.unwrap();
                 let start = Instant::now();
-                let client = reqwest::Client::builder()
-                    .proxy(reqwest::Proxy::all(&proxy).ok()?)
+                let client = rquest::Client::builder()
+                    .impersonate(impersonate())
+                    .proxy(rquest::Proxy::all(&proxy).ok()?)
                     .timeout(Duration::from_millis(5000))
                     .build()
                     .ok()?;
