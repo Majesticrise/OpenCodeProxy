@@ -1,0 +1,61 @@
+name: e2e-opencode
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js (for opencode CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Start opencode serve (sidecar)
+        run: |
+          opencode serve --port 8911 --hostname 127.0.0.1 &
+          echo $! > /tmp/opencode.pid
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8911/global/health > /dev/null; then
+              echo "opencode serve is up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Build Rust proxy
+        run: cargo build --release
+
+      - name: Start Rust proxy (pointing to local opencode)
+        run: |
+          ZEN_UPSTREAM=http://127.0.0.1:8911 \
+          ./target/release/zen-proxy &
+          echo $! > /tmp/zen-proxy.pid
+          sleep 3
+
+      - name: Probe /v1/chat/completions
+        run: |
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8910/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"hi"}],"stream":false}')
+          echo "status=$code"
+          cat /tmp/resp.json
+          if [ "$code" = "403" ]; then
+            echo "403 FreeTierError still present"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/zen-proxy.pid) 2>/dev/null || true
+          kill $(cat /tmp/opencode.pid) 2>/dev/null || true
