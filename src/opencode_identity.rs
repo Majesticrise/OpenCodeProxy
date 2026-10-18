@@ -178,10 +178,9 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
     }
 }
 
-/// 构造请求头，返回 (builder, session_id, request_id) 供日志使用
 pub fn apply_headers(
-    builder: rquest::RequestBuilder,
-) -> (rquest::RequestBuilder, String, String) {
+    builder: wreq::RequestBuilder,
+) -> (wreq::RequestBuilder, String, String) {
     let session_id = generate_session_id();
     let request_id = generate_request_id();
     let builder = builder

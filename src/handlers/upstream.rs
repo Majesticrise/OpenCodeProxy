@@ -7,19 +7,16 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// 统一的 impersonate 配置
-fn impersonate() -> rquest::impersonate::Impersonate {
-    use rquest::impersonate::Impersonate;
-    Impersonate::Chrome131
+fn impersonate() -> wreq_util::Emulation {
+    wreq_util::Emulation::Chrome131
 }
 
 async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), String> {
     let url = VALIDATE_TARGET.clone();
     let ua = OPENCODE_UA.as_str();
 
-    // 直连：加 impersonate
-    let direct = rquest::Client::builder()
-        .impersonate(impersonate())
+    let direct = wreq::Client::builder()
+        .emulation(impersonate())
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -40,10 +37,10 @@ async fn probe_upstream(state: &AppState) -> Result<(Vec<String>, String), Strin
         let Some(proxy) = state.pool.get_proxy().await else {
             break;
         };
-        let mut b = rquest::Client::builder()
-            .impersonate(impersonate())
+        let mut b = wreq::Client::builder()
+            .emulation(impersonate())
             .timeout(Duration::from_secs(8));
-        if let Ok(rp) = rquest::Proxy::all(&proxy) {
+        if let Ok(rp) = wreq::Proxy::all(&proxy) {
             b = b.proxy(rp);
         }
         let Ok(c) = b.build() else {

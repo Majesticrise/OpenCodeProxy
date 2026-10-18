@@ -13,10 +13,8 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
-/// 统一的 impersonate 配置
-fn impersonate() -> rquest::impersonate::Impersonate {
-    use rquest::impersonate::Impersonate;
-    Impersonate::Chrome131
+fn impersonate() -> wreq_util::Emulation {
+    wreq_util::Emulation::Chrome131
 }
 
 fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
@@ -56,18 +54,18 @@ fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
 async fn get_or_build_client(
     state: &AppState,
     proxy: &Option<String>,
-) -> Result<rquest::Client, rquest::Error> {
+) -> Result<wreq::Client, wreq::Error> {
     if let Some(c) = state.client_cache.get(proxy).map(|v| v.clone()) {
         return Ok(c);
     }
-    let mut b = rquest::Client::builder()
-        .impersonate(impersonate())
+    let mut b = wreq::Client::builder()
+        .emulation(impersonate())
         .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_millis(2500))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8);
     if let Some(p) = proxy {
-        if let Ok(rp) = rquest::Proxy::all(p) {
+        if let Ok(rp) = wreq::Proxy::all(p) {
             b = b.proxy(rp);
         }
     }
@@ -75,7 +73,6 @@ async fn get_or_build_client(
     state.client_cache.insert(proxy.clone(), c.clone());
     Ok(c)
 }
-
 async fn pick_unused_proxy(
     state: &AppState,
     tried: &std::collections::HashSet<String>,
@@ -92,7 +89,7 @@ async fn pick_unused_proxy(
 
 
 async fn aggregate_sse_to_json(
-    resp: rquest::Response,
+    resp: wreq::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::<u8>::new();
@@ -267,8 +264,7 @@ pub async fn chat_completions(
 
     let model_for_metrics = requested_model.clone();
     let max_retries = 8usize;
-    // ⭐ 类型改成 rquest::Response
-    let mut target_resp: Option<rquest::Response> = None;
+    let mut target_resp: Option<wreq::Response> = None;
     let mut last_proxy: Option<String> = None;
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidate_idx = 0usize;
@@ -296,7 +292,7 @@ pub async fn chat_completions(
         let client = match get_or_build_client(&state, &proxy).await {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to build rquest client: {}", e);
+                error!("Failed to build wreq client: {}", e);
                 continue;
             }
         };

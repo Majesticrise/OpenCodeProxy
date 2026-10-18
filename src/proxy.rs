@@ -23,9 +23,8 @@ const VALIDATION_BATCH_FLUSH: usize = 5;
 /// 池子上限（按 latency 排序后保留前 N 个）
 const MAX_POOL_SIZE: usize = 100;
 
-fn impersonate() -> rquest::impersonate::Impersonate {
-    use rquest::impersonate::Impersonate;
-    Impersonate::Chrome131
+fn impersonate() -> wreq_util::Emulation {
+    wreq_util::Emulation::Chrome131
 }
 
 #[derive(Clone)]
@@ -193,8 +192,8 @@ impl ProxyPool {
             ];
 
             let mut raw_ips = HashSet::new();
-            let client = rquest::Client::builder()
-                .impersonate(impersonate())
+            let client = wreq::Client::builder()
+                .emulation(impersonate())
                 .timeout(Duration::from_secs(8))
                 .build()
                 .unwrap();
@@ -274,12 +273,12 @@ impl ProxyPool {
             async move {
                 let _permit = sem.acquire().await.unwrap();
                 let start = Instant::now();
-                let client = rquest::Client::builder()
-                    .impersonate(impersonate())
-                    .proxy(rquest::Proxy::all(&proxy).ok()?)
+                let client = wreq::Client::builder()
+                    .emulation(impersonate())
+                    .proxy(wreq::Proxy::all(&proxy).ok()?)
                     .timeout(Duration::from_millis(5000))
                     .build()
-                    .ok()?;
+                    .ok()?
                 match client.get(&target).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         Some((proxy, start.elapsed().as_secs_f64()))
