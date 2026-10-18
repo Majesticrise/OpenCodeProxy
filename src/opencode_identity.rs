@@ -87,6 +87,11 @@ pub fn generate_session_id() -> String {
     format!("ses_{}{}", hex_full, suffix)
 }
 
+/// ⭐ 关键修正：x-opencode-request 的 12 位 hex 前缀必须是
+///    x-opencode-session 的按位取反（bitwise inverse）。
+///    社区 bantam-cpp 的抓包注释原话：
+///    "the 12-hex timestamp prefix in x-opencode-request is the
+///     bitwise inverse of x-opencode-session"。
 pub fn generate_request_id() -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -94,7 +99,8 @@ pub fn generate_request_id() -> String {
         .as_millis() as u64;
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed) & 0x3F;
     let raw = ((ts_ms & 0xFFFF_FFFF) << 12) | counter;
-    let hex_full = format!("{:012x}", raw);
+    let inverted = !raw & 0xFFFF_FFFF_FFFF;
+    let hex_full = format!("{:012x}", inverted);
     let mut rng = rand::thread_rng();
     let suffix: String = (0..14)
         .map(|_| BASE62[rng.gen_range(0..62)] as char)
@@ -224,9 +230,20 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
-    let mut sorted: Vec<(String, serde_json::Value)> = existing.into_iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    *arr = sorted.into_iter().map(|(_, v)| v).collect();
+    // ⭐ 保持官方工具的原始声明顺序（OFFICIAL_TOOLS 的顺序），
+    //    自定义工具追加在末尾。不再按字典序排序——
+    //    虽然顺序本身大概率不是 403 的直接原因，但更贴近官方
+    //    CLI 的实际行为，减少"指纹级"校验的潜在风险。
+    let mut ordered: Vec<serde_json::Value> = Vec::with_capacity(existing.len());
+    for &name in &OFFICIAL_TOOLS {
+        if let Some(v) = existing.remove(name) {
+            ordered.push(v);
+        }
+    }
+    for (_, v) in existing.into_iter() {
+        ordered.push(v);
+    }
+    *arr = ordered;
 
     if let Some(obj) = body.as_object_mut() {
         obj.entry("tool_choice")
@@ -235,6 +252,11 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
 }
 
 /// 构造请求头。`session_id` 由调用方决定（同一对话复用），`request_id` 每次递增。
+///
+/// ⭐ 关键修正：`x-opencode-project` 从硬编码的
+///    "prj_0000000000000000" 改为社区实测可用的 "global"。
+///    多个独立来源（OmniRoute 默认值、bantam-cpp 提交、LINUX DO 抓包）
+///    都确认这个值是 `global`，而非 `prj_` 前缀。
 pub fn apply_headers(
     builder: wreq::RequestBuilder,
     session_id: &str,
@@ -246,7 +268,7 @@ pub fn apply_headers(
         .header("x-opencode-client", "cli")
         .header("x-opencode-session", session_id)
         .header("x-opencode-request", request_id.as_str())
-        .header("x-opencode-project", "prj_0000000000000000")
+        .header("x-opencode-project", "global")
         .header("x-session-affinity", session_id)
         .header("X-Session-Id", session_id);
     (builder, session_id.to_string(), request_id)
