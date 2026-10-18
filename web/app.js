@@ -8,7 +8,6 @@ function escapeHtml(s) {
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/** 缩写格式：190.09K / 1.23M（用于图表 Y 轴等空间受限场景） */
 function fmtNum(n) {
     if (n == null) return '0';
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
@@ -17,7 +16,6 @@ function fmtNum(n) {
     return String(n);
 }
 
-/** 精确格式：带千分位，190,090（用于 Token、请求数等核心指标） */
 function fmtExact(n) {
     if (n == null) return '0';
     const num = Number(n);
@@ -99,7 +97,7 @@ function renderStatus() {
     const btn = $('#toggleBtn');
     btn.textContent = running ? '停止服务' : '启动服务';
     btn.className = 'btn ' + (running ? 'btn-danger' : 'btn-primary');
-    $('#p-size').textContent = s.pool_size ?? 0;
+    $('#p-size').textContent = fmtExact(s.pool_size ?? 0);
     $('#p-latency').textContent = s.avg_latency > 0 ? s.avg_latency.toFixed(2) + 's' : '-';
     $('#p-state').textContent = s.fetching ? '正在测速…' : (running ? '正常' : '已停止');
     $('#metaPort').textContent = ':' + (location.port || '8910');
@@ -131,7 +129,7 @@ function renderMetrics() {
     const m = state.metrics;
     if (!m) return;
 
-    // 总请求数、Token 相关：精确数字
+    // 主指标
     $('#m-total').textContent = fmtExact(m.total_requests || 0);
     $('#m-total').title = `精确值: ${fmtExact(m.total_requests || 0)} 次`;
     $('#m-success').textContent = (m.success_rate || 0).toFixed(1) + '%';
@@ -139,23 +137,31 @@ function renderMetrics() {
     $('#m-active').textContent = fmtExact(m.active_requests || 0);
     $('#m-active-streams').textContent = '流式 ' + fmtExact(m.active_streams || 0);
 
-    const totalTokens = m.total_tokens || 0;
-    const cachedTokens = m.cached_tokens || 0;
-    const reasoningTokens = m.reasoning_tokens || 0;
+    // Token
+    const total = m.total_tokens || 0;
+    const cached = m.cached_tokens || 0;
+    const reasoning = m.reasoning_tokens || 0;
+    const coverage = m.usage_coverage || 0;
 
-    $('#t-total').textContent = fmtExact(totalTokens);
-    $('#t-total').title = `精确值: ${fmtExact(totalTokens)} tokens` +
-        (totalTokens >= 1000 ? ` (${fmtNum(totalTokens)})` : '');
+    $('#t-total').textContent = fmtExact(total);
+    $('#t-total').title = `精确值: ${fmtExact(total)} tokens` +
+        (total >= 1000 ? ` (${fmtNum(total)})` : '');
 
-    $('#t-cached').textContent = fmtExact(cachedTokens);
-    $('#t-cached').title = `精确值: ${fmtExact(cachedTokens)} tokens` +
-        (totalTokens > 0 ? ` · 占比 ${((cachedTokens / totalTokens) * 100).toFixed(1)}%` : '');
+    // 缓存命中
+    const cachedPct = total > 0 ? Math.min((cached / total) * 100, 100) : 0;
+    $('#t-cached').textContent = fmtExact(cached);
+    $('#t-cached').title = `精确值: ${fmtExact(cached)} tokens · 占比 ${cachedPct.toFixed(1)}%`;
+    $('#t-cached-bar').style.width = cachedPct.toFixed(1) + '%';
 
-    $('#t-reasoning').textContent = fmtExact(reasoningTokens);
-    $('#t-reasoning').title = `精确值: ${fmtExact(reasoningTokens)} tokens` +
-        (totalTokens > 0 ? ` · 占比 ${((reasoningTokens / totalTokens) * 100).toFixed(1)}%` : '');
+    // 推理
+    const reasoningPct = total > 0 ? Math.min((reasoning / total) * 100, 100) : 0;
+    $('#t-reasoning').textContent = fmtExact(reasoning);
+    $('#t-reasoning').title = `精确值: ${fmtExact(reasoning)} tokens · 占比 ${reasoningPct.toFixed(1)}%`;
+    $('#t-reasoning-bar').style.width = reasoningPct.toFixed(1) + '%';
 
-    $('#t-coverage').textContent = (m.usage_coverage || 0).toFixed(1) + '%';
+    // 覆盖率
+    $('#t-coverage').textContent = coverage.toFixed(1) + '%';
+    $('#t-coverage-bar').style.width = Math.min(coverage, 100).toFixed(1) + '%';
 
     renderModelList(m.models || []);
     renderStatusList(m.endpoints || []);
@@ -216,7 +222,7 @@ function drawChart() {
         ctx.fillText('暂无数据', W / 2, H / 2);
         return;
     }
-    const padL = 44, padR = 12, padT = 10, padB = 22;
+    const padL = 44, padR = 12, padT = 8, padB = 20;
     const cw = W - padL - padR;
     const ch = H - padT - padB;
     const maxVal = Math.max(...data.map((d) => d[1][2]), 1);
@@ -232,7 +238,7 @@ function drawChart() {
         ctx.moveTo(padL, y);
         ctx.lineTo(padL + cw, y);
         ctx.stroke();
-        // Y 轴保持缩写（空间有限）
+        // Y 轴保持缩写，避免撑开左侧空间
         ctx.fillText(fmtNum(Math.round(maxVal * (1 - i / 4))), padL - 6, y);
     }
     const slotW = cw / data.length;
@@ -254,9 +260,7 @@ function drawChart() {
 function parseLogLine(line) {
     // 新格式：[2026-10-18 06:30:15.678] [ INFO] message
     const m = line.match(/^\[([\d\- :\.]+)\]\s+\[\s*(\w+)\]\s+([\s\S]*)$/);
-    if (m) {
-        return { ts: m[1].trim(), level: m[2].toUpperCase(), msg: m[3] };
-    }
+    if (m) return { ts: m[1].trim(), level: m[2].toUpperCase(), msg: m[3] };
     return { ts: '', level: 'INFO', msg: line };
 }
 

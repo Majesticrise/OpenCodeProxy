@@ -64,25 +64,69 @@
                             <div class="metric-sub" id="m-active-streams">流式 0</div>
                         </div>
                     </div>
+
                     <div class="grid grid-2">
-                        <div class="card">
+                        <!-- ⭐ Token 使用：大数字 + 三条占比条 -->
+                        <div class="card token-card">
                             <div class="card-title">Token 使用</div>
-                            <div class="kv"><span>总量</span><span id="t-total">0</span></div>
-                            <div class="kv"><span>缓存命中</span><span id="t-cached">0</span></div>
-                            <div class="kv"><span>推理</span><span id="t-reasoning">0</span></div>
-                            <div class="kv"><span>使用覆盖率</span><span id="t-coverage">0%</span></div>
+                            <div class="hero-block">
+                                <div class="hero-value" id="t-total">0</div>
+                                <div class="hero-label">累计 tokens</div>
+                            </div>
+                            <div class="token-list">
+                                <div class="token-row">
+                                    <div class="token-row-head">
+                                        <span class="token-row-label">
+                                            <span class="dot-marker dot-green"></span>缓存命中
+                                        </span>
+                                        <span class="token-row-value" id="t-cached">0</span>
+                                    </div>
+                                    <div class="progress-track">
+                                        <div class="progress-fill fill-green" id="t-cached-bar" style="width:0%"></div>
+                                    </div>
+                                </div>
+                                <div class="token-row">
+                                    <div class="token-row-head">
+                                        <span class="token-row-label">
+                                            <span class="dot-marker dot-purple"></span>推理
+                                        </span>
+                                        <span class="token-row-value" id="t-reasoning">0</span>
+                                    </div>
+                                    <div class="progress-track">
+                                        <div class="progress-fill fill-purple" id="t-reasoning-bar" style="width:0%"></div>
+                                    </div>
+                                </div>
+                                <div class="token-row">
+                                    <div class="token-row-head">
+                                        <span class="token-row-label">
+                                            <span class="dot-marker dot-blue"></span>使用覆盖率
+                                        </span>
+                                        <span class="token-row-value" id="t-coverage">0%</span>
+                                    </div>
+                                    <div class="progress-track">
+                                        <div class="progress-fill fill-blue" id="t-coverage-bar" style="width:0%"></div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
-                        <div class="card">
+
+                        <!-- ⭐ 代理池：大数字 + 键值 -->
+                        <div class="card pool-card">
                             <div class="card-title">代理池</div>
-                            <div class="kv"><span>节点数</span><span id="p-size">0</span></div>
+                            <div class="hero-block">
+                                <div class="hero-value" id="p-size">0</div>
+                                <div class="hero-label">可用节点</div>
+                            </div>
                             <div class="kv"><span>平均延迟</span><span id="p-latency">-</span></div>
                             <div class="kv"><span>状态</span><span id="p-state">-</span></div>
                         </div>
                     </div>
-                    <div class="card">
+
+                    <div class="card chart-card">
                         <div class="card-title">每分钟 Token 使用</div>
-                        <canvas id="chartPerMinute" height="180"></canvas>
+                        <canvas id="chartPerMinute" height="140"></canvas>
                     </div>
+
                     <div class="grid grid-2">
                         <div class="card">
                             <div class="card-title">按模型统计</div>
@@ -184,7 +228,7 @@
                         <div class="card-title">运行配置</div>
                         <p class="muted">当前配置通过环境变量注入，页面只读。</p>
                         <div class="kv"><span>监听端口</span><code>8910</code></div>
-                        <div class="kv"><span>上游地址</span><code>https://opencode.ai/zen/v1</code></div>
+                        <div class="kv"><span>上游地址</span><code>https://opencode.ai/inference/openai/v1</code></div>
                         <div class="kv"><span>代理文件</span><code>proxies.txt</code></div>
                         <div class="kv"><span>日志级别</span><code>info</code></div>
                     </div>

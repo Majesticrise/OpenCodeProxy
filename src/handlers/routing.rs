@@ -20,10 +20,11 @@ pub async fn api_set_routing(
         (guard.clone(), before.0, before.1)
     };
 
-    // 异步落盘：失败只 warn，不影响响应
+    // 异步落盘：clone 一份给后台任务，原 snapshot 留给响应
+    let snapshot_for_save = snapshot.clone();
     let path = ROUTING_FILE.clone();
     tokio::spawn(async move {
-        match serde_json::to_string_pretty(&snapshot) {
+        match serde_json::to_string_pretty(&snapshot_for_save) {
             Ok(json_str) => {
                 if let Err(e) = tokio::fs::write(&path, json_str).await {
                     warn!("Failed to persist routing config: {}", e);
