@@ -89,8 +89,6 @@ async fn pick_unused_proxy(
     None
 }
 
-/// session → 代理绑定表的软上限。实际使用极难触发，
-/// 纯为长期运行兜底，避免无限增长。
 const MAX_SESSION_BINDINGS: usize = 10_000;
 
 fn update_session_binding(
@@ -108,12 +106,22 @@ fn update_session_binding(
     bindings.insert(session_id.to_string(), proxy);
 }
 
+/// 聚合上游 SSE 为非流式 JSON。
+///
+/// ⭐ P2 修正：除了 `content` 还累加：
+///   - `reasoning_content`（deepseek-reasoner 类模型的推理内容）
+///   - `tool_calls`（按 `index` 合并 delta，拼接 arguments 字符串）
+///
+/// 这样非流式下游才能拿到与流式下游等价的信息。
 async fn aggregate_sse_to_json(
     resp: wreq::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::<u8>::new();
     let mut content = String::new();
+    let mut reasoning_content = String::new();
+    // tool_calls 按 index 合并（Vec 下标即 OpenAI 的 tool_call.index）
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let mut usage: Option<crate::metrics::UsageInfo> = None;
     let mut id = String::new();
     let mut model = String::new();
@@ -154,15 +162,72 @@ async fn aggregate_sse_to_json(
                                 usage = Some(crate::metrics::UsageInfo::from_json(u));
                             }
                         }
+
+                        // ⭐ 拿整个 delta 对象，分别处理 content / reasoning / tool_calls
                         if let Some(delta) = v
                             .get("choices")
                             .and_then(|c| c.as_array())
                             .and_then(|a| a.first())
                             .and_then(|c| c.get("delta"))
-                            .and_then(|d| d.get("content"))
-                            .and_then(|c| c.as_str())
                         {
-                            content.push_str(delta);
+                            if let Some(c) =
+                                delta.get("content").and_then(|c| c.as_str())
+                            {
+                                content.push_str(c);
+                            }
+                            if let Some(rc) = delta
+                                .get("reasoning_content")
+                                .and_then(|r| r.as_str())
+                            {
+                                reasoning_content.push_str(rc);
+                            }
+                            if let Some(tc_arr) =
+                                delta.get("tool_calls").and_then(|t| t.as_array())
+                            {
+                                for tc in tc_arr {
+                                    let idx = tc
+                                        .get("index")
+                                        .and_then(|i| i.as_u64())
+                                        .unwrap_or(0)
+                                        as usize;
+                                    while tool_calls.len() <= idx {
+                                        tool_calls.push(json!({
+                                            "id": "",
+                                            "type": "function",
+                                            "function": { "name": "", "arguments": "" }
+                                        }));
+                                    }
+                                    if let Some(cid) =
+                                        tc.get("id").and_then(|i| i.as_str())
+                                    {
+                                        if !cid.is_empty() {
+                                            tool_calls[idx]["id"] = json!(cid);
+                                        }
+                                    }
+                                    if let Some(name) = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|n| n.as_str())
+                                    {
+                                        if !name.is_empty() {
+                                            tool_calls[idx]["function"]["name"] =
+                                                json!(name);
+                                        }
+                                    }
+                                    if let Some(args) = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|a| a.as_str())
+                                    {
+                                        let prev = tool_calls[idx]["function"]
+                                            ["arguments"]
+                                            .as_str()
+                                            .unwrap_or("");
+                                        tool_calls[idx]["function"]["arguments"] =
+                                            json!(format!("{}{}", prev, args));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -179,7 +244,7 @@ async fn aggregate_sse_to_json(
         }
     }
 
-    if broke_midway && content.is_empty() && id.is_empty() {
+    if broke_midway && content.is_empty() && id.is_empty() && tool_calls.is_empty() {
         return Err("upstream stream broke before any data".to_string());
     }
 
@@ -188,20 +253,42 @@ async fn aggregate_sse_to_json(
         .unwrap_or_default()
         .as_secs();
 
-    let finish_reason = if broke_midway { "length" } else { "stop" };
+    // ⭐ P2 修正：finish_reason 语义修正。
+    //    "length" 在 OpenAI 语义里是 token 上限，上游断流用它会误导客户端。
+    //    有 tool_calls → "tool_calls"；否则一律 "stop"（尽力交付已收到的部分）。
+    //    上游中断的事实通过非标准字段 x_upstream_broken 暴露。
+    let finish_reason = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
 
-    let response_json = json!({
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !reasoning_content.is_empty() {
+        message["reasoning_content"] = json!(reasoning_content);
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    let mut response_json = json!({
         "id": if id.is_empty() { format!("chatcmpl-{}", created) } else { id },
         "object": "chat.completion",
         "created": created,
         "model": if model.is_empty() { "unknown" } else { &model },
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "finish_reason": finish_reason
         }],
         "usage": usage
     });
+    if broke_midway {
+        response_json["x_upstream_broken"] = json!(true);
+    }
 
     let bytes =
         serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
@@ -249,8 +336,7 @@ pub async fn chat_completions(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // ⭐ 稳定 session：优先客户端头，否则用 messages 哈希派生
-    let session_id = headers
+    let mut session_id = headers
         .get("x-opencode-session")
         .or_else(|| headers.get("X-Session-Id"))
         .and_then(|v| v.to_str().ok())
@@ -258,16 +344,21 @@ pub async fn chat_completions(
         .map(String::from)
         .unwrap_or_else(|| opencode_identity::derive_session_from_messages(&body_json));
 
-    // ⭐ 查询 session → 代理绑定
-    //   Some(Some(url))：上次走代理 url 成功
-    //   Some(None)：上次走直连成功
-    //   None：未绑定
+    let messages_snapshot: serde_json::Value = body_json
+        .get("messages")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+
     let bound: Option<Option<String>> = {
         let bindings = state.session_proxy_binding.read().unwrap();
         bindings.get(&session_id).cloned()
     };
 
-    // 绑定代理且当前仍可用 → 第一次 attempt 优先复用
+    // 注意：preferred_proxy / skip_proxy_loop 只基于「进入本次请求时的绑定」计算。
+    // 如果循环内因 403 触发换 session，这两个值不会重算——但此时已经进入循环，
+    // preferred_proxy 只在 attempt == 0 被消费（已过去），skip_proxy_loop 只影响
+    // 是否进循环（已决定进入）。所以现有行为是正确的，只是依赖「进入时机」。
+    // 如果将来把换 session 逻辑移到循环开始前，需要重新计算这两个值。
     let preferred_proxy: Option<String> = match &bound {
         Some(Some(url)) => {
             if state.pool.is_available(url).await {
@@ -279,7 +370,6 @@ pub async fn chat_completions(
         _ => None,
     };
 
-    // 绑定直连 → 跳过代理循环，直接走兜底
     let skip_proxy_loop = matches!(bound, Some(None));
 
     let routing_snapshot = state.routing.read().unwrap().clone();
@@ -328,6 +418,7 @@ pub async fn chat_completions(
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidate_idx = 0usize;
     let mut first_upstream_error: Option<(u16, bytes::Bytes)> = None;
+    let mut freetier_403_count = 0u32;
 
     for attempt in 0..max_retries {
         if skip_proxy_loop {
@@ -343,7 +434,6 @@ pub async fn chat_completions(
             obj.insert("model".to_string(), json!(current_upstream));
         }
 
-        // ⭐ 第一次 attempt 优先用绑定代理；之后正常随机选
         let proxy = if attempt == 0 && preferred_proxy.is_some() {
             preferred_proxy.clone()
         } else {
@@ -408,7 +498,6 @@ pub async fn chat_completions(
                     if let Some(ref p) = proxy {
                         state.pool.report_success(p).await;
                     }
-                    // ⭐ 成功 → 写回绑定（同步锁，不跨 await）
                     {
                         let mut bindings = state.session_proxy_binding.write().unwrap();
                         update_session_binding(&mut bindings, &session_id, proxy.clone());
@@ -430,13 +519,37 @@ pub async fn chat_completions(
                 let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
                 if code == 403 && body_str.contains("FreeTierError") {
+                    freetier_403_count += 1;
                     warn!(
-                        "Proxy {:?} hit 403 FreeTierError. Banning for 15min; will retry with same session.",
-                        proxy
+                        "Proxy {:?} hit 403 FreeTierError ({}/2). session={}",
+                        proxy,
+                        freetier_403_count,
+                        &session_id[..session_id.len().min(12)]
                     );
                     if let Some(ref p) = proxy {
                         state.pool.report_banned(p).await;
                     }
+                    if freetier_403_count >= 2 {
+                        {
+                            let mut bindings = state.session_proxy_binding.write().unwrap();
+                            bindings.remove(&session_id);
+                        }
+                        let seed_body = serde_json::json!({
+                            "model": requested_model,
+                            "messages": messages_snapshot.clone(),
+                        });
+                        let new_session = opencode_identity::derive_session_from_messages_with_nonce(
+                            &seed_body,
+                            freetier_403_count,
+                        );
+                        warn!(
+                            "403 FreeTierError threshold reached; rotating session {} → {}",
+                            &session_id[..session_id.len().min(12)],
+                            &new_session[..new_session.len().min(12)]
+                        );
+                        session_id = new_session;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
                     continue;
                 }
 
@@ -541,7 +654,6 @@ pub async fn chat_completions(
             let builder = builder.header("Accept", "text/event-stream");
             match builder.json(&forward_body).send().await {
                 Ok(r) => {
-                    // ⭐ 直连成功 → 绑定为 None
                     {
                         let mut bindings = state.session_proxy_binding.write().unwrap();
                         update_session_binding(&mut bindings, &session_id, None);
@@ -549,7 +661,6 @@ pub async fn chat_completions(
                     r
                 }
                 Err(e) => {
-                    // ⭐ 直连失败 → 删除绑定，下次重新走代理循环
                     {
                         let mut bindings = state.session_proxy_binding.write().unwrap();
                         bindings.remove(&session_id);
@@ -588,7 +699,6 @@ pub async fn chat_completions(
         status, requested_model, last_proxy
     );
 
-    // ── 非流式下游：聚合 SSE 为 JSON ──
     if !downstream_stream {
         let (bytes, usage) = match aggregate_sse_to_json(resp).await {
             Ok(x) => x,
@@ -631,7 +741,6 @@ pub async fn chat_completions(
         return response;
     }
 
-    // ── 流式下游：直接转发 SSE ──
     state
         .metrics
         .active_requests
