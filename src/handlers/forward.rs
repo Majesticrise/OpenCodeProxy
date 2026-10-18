@@ -8,6 +8,7 @@ use axum::{
 use futures_util::{stream, StreamExt};
 use serde_json::json;
 use std::{
+    collections::HashMap,
     sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -88,6 +89,25 @@ async fn pick_unused_proxy(
     None
 }
 
+/// session → 代理绑定表的软上限。实际使用极难触发，
+/// 纯为长期运行兜底，避免无限增长。
+const MAX_SESSION_BINDINGS: usize = 10_000;
+
+fn update_session_binding(
+    bindings: &mut HashMap<String, Option<String>>,
+    session_id: &str,
+    proxy: Option<String>,
+) {
+    if bindings.len() >= MAX_SESSION_BINDINGS && !bindings.contains_key(session_id) {
+        warn!(
+            "Session binding table reached {} entries; clearing to prevent unbounded growth",
+            MAX_SESSION_BINDINGS
+        );
+        bindings.clear();
+    }
+    bindings.insert(session_id.to_string(), proxy);
+}
+
 async fn aggregate_sse_to_json(
     resp: wreq::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
@@ -159,7 +179,6 @@ async fn aggregate_sse_to_json(
         }
     }
 
-    // 一个字节的内容都没收到就失败 → 跟流式分支的 "error event" 对齐，返回 Err 让调用方转 502
     if broke_midway && content.is_empty() && id.is_empty() {
         return Err("upstream stream broke before any data".to_string());
     }
@@ -239,15 +258,44 @@ pub async fn chat_completions(
         .map(String::from)
         .unwrap_or_else(|| opencode_identity::derive_session_from_messages(&body_json));
 
+    // ⭐ 查询 session → 代理绑定
+    //   Some(Some(url))：上次走代理 url 成功
+    //   Some(None)：上次走直连成功
+    //   None：未绑定
+    let bound: Option<Option<String>> = {
+        let bindings = state.session_proxy_binding.read().unwrap();
+        bindings.get(&session_id).cloned()
+    };
+
+    // 绑定代理且当前仍可用 → 第一次 attempt 优先复用
+    let preferred_proxy: Option<String> = match &bound {
+        Some(Some(url)) => {
+            if state.pool.is_available(url).await {
+                Some(url.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // 绑定直连 → 跳过代理循环，直接走兜底
+    let skip_proxy_loop = matches!(bound, Some(None));
+
     let routing_snapshot = state.routing.read().unwrap().clone();
     let candidates = resolve_candidates(&routing_snapshot, &requested_model);
     let enable_fallback = routing_snapshot.enable_fallback_chain;
 
     info!(
-        "→ {} model={} session={} (downstream_stream={})",
+        "→ {} model={} session={} bind={} (downstream_stream={})",
         if downstream_stream { "STREAM" } else { "SYNC  " },
         requested_model,
         &session_id[..session_id.len().min(12)],
+        match &bound {
+            Some(Some(url)) => format!("proxy:{}", &url[..url.len().min(16)]),
+            Some(None) => "direct".to_string(),
+            None => "none".to_string(),
+        },
         downstream_stream
     );
 
@@ -282,6 +330,10 @@ pub async fn chat_completions(
     let mut first_upstream_error: Option<(u16, bytes::Bytes)> = None;
 
     for attempt in 0..max_retries {
+        if skip_proxy_loop {
+            break;
+        }
+
         let current_upstream = candidates
             .get(candidate_idx)
             .cloned()
@@ -291,7 +343,13 @@ pub async fn chat_completions(
             obj.insert("model".to_string(), json!(current_upstream));
         }
 
-        let proxy = pick_unused_proxy(&state, &tried).await;
+        // ⭐ 第一次 attempt 优先用绑定代理；之后正常随机选
+        let proxy = if attempt == 0 && preferred_proxy.is_some() {
+            preferred_proxy.clone()
+        } else {
+            pick_unused_proxy(&state, &tried).await
+        };
+
         if proxy.is_none() && attempt > 0 && candidate_idx + 1 >= candidates.len() {
             break;
         }
@@ -349,6 +407,11 @@ pub async fn chat_completions(
                 if resp.status().is_success() {
                     if let Some(ref p) = proxy {
                         state.pool.report_success(p).await;
+                    }
+                    // ⭐ 成功 → 写回绑定（同步锁，不跨 await）
+                    {
+                        let mut bindings = state.session_proxy_binding.write().unwrap();
+                        update_session_binding(&mut bindings, &session_id, proxy.clone());
                     }
                     target_resp = Some(resp);
                     break;
@@ -477,13 +540,25 @@ pub async fn chat_completions(
             };
             let builder = builder.header("Accept", "text/event-stream");
             match builder.json(&forward_body).send().await {
-                Ok(r) => r,
+                Ok(r) => {
+                    // ⭐ 直连成功 → 绑定为 None
+                    {
+                        let mut bindings = state.session_proxy_binding.write().unwrap();
+                        update_session_binding(&mut bindings, &session_id, None);
+                    }
+                    r
+                }
                 Err(e) => {
+                    // ⭐ 直连失败 → 删除绑定，下次重新走代理循环
+                    {
+                        let mut bindings = state.session_proxy_binding.write().unwrap();
+                        bindings.remove(&session_id);
+                    }
                     return (
                         StatusCode::BAD_GATEWAY,
                         format!("Upstream direct connection failed: {}", e),
                     )
-                        .into_response()
+                        .into_response();
                 }
             }
         }
@@ -578,9 +653,6 @@ pub async fn chat_completions(
     let tracker_for_stream = tracker.clone();
     let buf_for_stream = usage_buf.clone();
 
-    // ⭐ 关键修复：用 stream::unfold 显式管理状态。
-    //   上游流断裂时 reqwest 会反复返回 Err，必须只处理一次并结束流，
-    //   否则会刷屏日志 + 发出成百上千个 [DONE]，让客户端无法解析。
     let byte_stream = resp.bytes_stream();
 
     let stream = stream::unfold(
@@ -592,7 +664,6 @@ pub async fn chat_completions(
 
             match inner.next().await {
                 Some(Ok(chunk)) => {
-                    // 处理 usage
                     {
                         let mut b = buf.lock().unwrap();
                         if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut b) {
@@ -600,7 +671,6 @@ pub async fn chat_completions(
                         }
                     }
 
-                    // 累加 SSE content 字符数（fallback 估算用）
                     if let Ok(text) = std::str::from_utf8(&chunk) {
                         for line in text.lines() {
                             let line = line.trim();

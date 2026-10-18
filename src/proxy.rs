@@ -17,11 +17,14 @@ const COOLDOWN_RATE_LIMIT: Duration = Duration::from_secs(30);
 const COOLDOWN_CONNECTION: Duration = Duration::from_secs(300);
 const COOLDOWN_BANNED: Duration = Duration::from_secs(900);
 const MAX_FAILS_BEFORE_REMOVE: u32 = 5;
+/// Banned 阈值单独设更高：403 FreeTierError 有时是 session 层面的临时拒绝，
+/// 换一次 session 可能就过；攒 10 次才移除，避免代理池被瞬时误判掏空。
+const MAX_BANS_BEFORE_REMOVE: u32 = 10;
 
 /// 每验证成功多少个代理就 flush 一批到池子
 const VALIDATION_BATCH_FLUSH: usize = 5;
 /// 池子上限（按 latency 排序后保留前 N 个）
-const MAX_POOL_SIZE: usize = 100;
+const MAX_POOL_SIZE: usize = 120;
 
 fn impersonate() -> wreq_util::Profile {
     wreq_util::Profile::Chrome131
@@ -68,8 +71,13 @@ impl FailureKind {
         }
     }
 
-    fn counts_toward_removal(self) -> bool {
-        matches!(self, FailureKind::Connection)
+    /// 该失败类型累计 fail_count 并在达到阈值时被移除；RateLimit 不计入。
+    fn max_fails_before_removal(self) -> Option<u32> {
+        match self {
+            FailureKind::Connection => Some(MAX_FAILS_BEFORE_REMOVE),
+            FailureKind::Banned => Some(MAX_BANS_BEFORE_REMOVE),
+            FailureKind::RateLimit => None,
+        }
     }
 
     fn label(self) -> &'static str {
@@ -232,15 +240,6 @@ impl ProxyPool {
         });
     }
 
-    /// ⭐ 渐进式验证：每 VALIDATION_BATCH_FLUSH 个成功就 flush 一批到池子，
-    ///    不用等全部测完。
-    ///
-    /// 设计要点：
-    ///   1. **开始时不清空池子** —— 老代理继续服务，新代理不断加入
-    ///   2. **每 10 个成功 flush 一次** —— 首次可用代理在 ~1s 内就出现
-    ///   3. **每次 flush 按 latency 排序 + 截断到 MAX_POOL_SIZE** —— 好代理挤掉坏代理
-    ///   4. **复用 existing_entries 的实战数据** —— fail_count / last_success / cooldown 不丢
-    ///   5. **持久化只在结束时做一次** —— flush 是为了"当前进程立即可用"，与落盘无关
     async fn validate_proxies(&self, raw_proxies: Vec<String>) {
         let sample_size = std::cmp::min(7000, raw_proxies.len());
         let mut test_targets = raw_proxies;
@@ -248,7 +247,6 @@ impl ProxyPool {
         test_targets.truncate(sample_size);
         let total_targets = test_targets.len();
 
-        // 开始时快照现有代理（用于保留实战数据）
         let existing_entries: HashMap<String, ProxyEntry> = {
             let inner = self.inner.read().await;
             inner
@@ -295,7 +293,6 @@ impl ProxyPool {
                 total_validated += 1;
                 batch.push(item);
 
-                // ⭐ 凑够一批就 flush
                 if batch.len() >= VALIDATION_BATCH_FLUSH {
                     let flushed =
                         self.flush_validation_batch(&mut batch, &existing_entries).await;
@@ -315,7 +312,6 @@ impl ProxyPool {
             }
         }
 
-        // 最后残留的一批（不足 VALIDATION_BATCH_FLUSH 个）
         if !batch.is_empty() {
             let flushed = self
                 .flush_validation_batch(&mut batch, &existing_entries)
@@ -329,7 +325,6 @@ impl ProxyPool {
             }
         }
 
-        // ── 总结 ──
         let (pool_size, available_count, fastest) = {
             let inner = self.inner.read().await;
             let now = Instant::now();
@@ -360,15 +355,9 @@ impl ProxyPool {
             );
         }
 
-        // 只在结束时落盘一次
         self.persist_verified_proxies().await;
     }
 
-    /// 把一批验证成功的代理合并到池子。
-    /// 返回实际合并的数量。
-    ///
-    /// 注意：不删除池中已有的其他代理（本次验证没覆盖到的），
-    /// 只是新增/覆盖本批次的 URL，并按 latency 排序截断。
     async fn flush_validation_batch(
         &self,
         batch: &mut Vec<(String, f64)>,
@@ -381,7 +370,6 @@ impl ProxyPool {
 
         let mut inner = self.inner.write().await;
         for (url, lat) in batch.drain(..) {
-            // 复用实战数据（fail_count / last_success / cooldown）
             let entry = match existing.get(&url).cloned() {
                 Some(mut old) => {
                     old.latency = lat;
@@ -390,7 +378,6 @@ impl ProxyPool {
                 None => ProxyEntry::new(url, lat),
             };
 
-            // 池子里已有相同 URL 就覆盖（更新 latency），否则追加
             if let Some(pos) = inner.proxies.iter().position(|p| p.url == entry.url) {
                 inner.proxies[pos] = entry;
             } else {
@@ -398,7 +385,6 @@ impl ProxyPool {
             }
         }
 
-        // 按 latency 升序（好的排前面），0.0 表示本地手动配置的优先级最高
         inner.proxies.sort_by(|a, b| {
             let la = if a.latency <= 0.0 { -1.0 } else { a.latency };
             let lb = if b.latency <= 0.0 { -1.0 } else { b.latency };
@@ -411,7 +397,6 @@ impl ProxyPool {
         count
     }
 
-    /// 把当前池子中"可用"的代理持久化到 verified_proxies.json。
     async fn persist_verified_proxies(&self) {
         let now = Instant::now();
         let to_save: Vec<(String, f64)> = {
@@ -462,6 +447,19 @@ impl ProxyPool {
         slice.choose(&mut rand::thread_rng()).map(|x| x.url.clone())
     }
 
+    /// 检查某个 URL 对应的代理当前是否可用（存在于池中且未处于冷却）。
+    /// 用于 session → 代理绑定的可用性判定。
+    pub async fn is_available(&self, proxy_url: &str) -> bool {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        inner
+            .proxies
+            .iter()
+            .find(|p| p.url == proxy_url)
+            .map(|p| p.available(now))
+            .unwrap_or(false)
+    }
+
     pub async fn report_failure(&self, proxy_url: &str) {
         self.report_kind(proxy_url, FailureKind::Connection).await;
     }
@@ -485,7 +483,7 @@ impl ProxyPool {
 
     async fn report_kind(&self, proxy_url: &str, kind: FailureKind) {
         let cooldown = kind.cooldown();
-        let counts = kind.counts_toward_removal();
+        let max_fails = kind.max_fails_before_removal();
         let label = kind.label();
 
         let (after_len, fetching) = {
@@ -494,11 +492,13 @@ impl ProxyPool {
 
             let mut should_remove = false;
             if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
-                if counts {
+                if max_fails.is_some() {
                     entry.fail_count += 1;
                 }
                 entry.cooldown_until = Some(now + cooldown);
-                should_remove = counts && entry.fail_count >= MAX_FAILS_BEFORE_REMOVE;
+                should_remove = max_fails
+                    .map(|max| entry.fail_count >= max)
+                    .unwrap_or(false);
             }
 
             if should_remove {

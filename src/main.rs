@@ -16,12 +16,12 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    // 重命名导入，避免与 crate 内的 `mod middleware` 冲突
     middleware as axum_middleware,
     routing::{get, post},
     Router,
 };
 use std::{
+    collections::HashMap,
     env,
     path::Path,
     sync::{Arc, RwLock},
@@ -69,7 +69,7 @@ async fn main() {
         }
     });
 
-    // ── 模型路由（从环境变量初始化，运行时可在 WebUI 修改） ──
+    // ── 模型路由 ──
     let routing = RoutingConfig::from_file_or_env();
     if routing.mapping.is_empty() {
         info!("Routing: no rules configured, models will be passed through as-is.");
@@ -91,7 +91,6 @@ async fn main() {
     };
     let metrics = Arc::new(MetricsStore::with_persistence(metrics_path));
 
-    // 后台每 5 秒 flush 一次
     let metrics_for_flush = metrics.clone();
     tokio::spawn(async move {
         loop {
@@ -108,31 +107,25 @@ async fn main() {
         client_cache: Arc::new(DashMap::new()),
         routing: Arc::new(RwLock::new(routing)),
         upstream_models: Arc::new(RwLock::new(Default::default())),
+        session_proxy_binding: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    // ⚠️ 每个 (路径, 方法) 只出现一次，否则 axum 会 panic
     let app = Router::new()
-        // 静态资源与健康检查
         .route("/", get(handlers::root))
         .route("/static/*path", get(handlers::static_handler))
         .route("/health", get(handlers::health))
-        // 状态与监控
         .route("/api/status", get(handlers::api_status))
         .route("/api/logs", get(handlers::api_logs))
         .route("/api/metrics", get(handlers::api_metrics))
         .route("/api/toggle", post(handlers::api_toggle))
-        // 模型路由配置（GET 读 / POST 写）
         .route(
             "/api/routing",
             get(handlers::api_get_routing).post(handlers::api_set_routing),
         )
-        // 上游模型探测
         .route("/api/upstream/models", get(handlers::api_upstream_models))
         .route("/api/upstream/refresh", post(handlers::api_upstream_refresh))
-        // OpenAI 兼容端点
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
-        // 剥离 Authorization 头（crate 内部 middleware 模块）
         .layer(axum_middleware::from_fn(middleware::strip_auth_middleware))
         .with_state(state);
 
