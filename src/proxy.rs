@@ -434,6 +434,7 @@ impl ProxyPool {
     pub async fn get_proxy(&self) -> Option<String> {
         let inner = self.inner.read().await;
         let now = Instant::now();
+        let mut rng = rand::thread_rng();
 
         let available: Vec<&ProxyEntry> = inner
             .proxies
@@ -445,23 +446,23 @@ impl ProxyPool {
             return None;
         }
 
-        // 「成功数优先」仅从已验证稳定工作的节点中随机选择；无成功记录时，
-        // 在少量最快节点中冷启动盲选，加速首轮代理验证。
-        let proven: Vec<&ProxyEntry> = available.iter().filter(|p| p.success_count > 0).collect();
-        if proven.is_empty() {
-            let limit = std::cmp::min(15, available.len());
-            let slice = &available[..limit];
-            slice
-                .choose(&mut rand::thread_rng())
-                .map(|p| p.url.clone())
-        } else {
-            proven
-                .iter()
-                .choose(&mut rand::thread_rng())
-                .map(|p| p.url.clone())
-        }
-    }
+        // 「成功数优先」：只在历史成功过的节点里选；没有成功记录时，
+        // 在最快的前 15 个节点中冷启动盲选。
+        let proven: Vec<&ProxyEntry> = available
+            .iter()
+            .copied()
+            .filter(|p| p.success_count > 0)
+            .collect();
 
+        if !proven.is_empty() {
+            // proven 是 Vec<&ProxyEntry>，choose 返回 Option<&&ProxyEntry>，
+            // p.url.clone() 通过 auto-deref 得到 String。
+            return proven.choose(&mut rng).map(|p| p.url.clone());
+        }
+
+        let limit = std::cmp::min(15, available.len());
+        available[..limit].choose(&mut rng).map(|p| p.url.clone())
+    }
     /// 检查某个 URL 对应的代理当前是否可用（存在于池中且未处于冷却）。
     /// 用于 session → 代理绑定的可用性判定。
     pub async fn is_available(&self, proxy_url: &str) -> bool {
