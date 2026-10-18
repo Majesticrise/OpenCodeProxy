@@ -49,6 +49,9 @@ fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
             }
         }
     }
+    if let Some(tools) = body.get("tools") {
+        total_chars += tools.to_string().chars().count() as u64;
+    }
     (total_chars / 3).max(1)
 }
 
