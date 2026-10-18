@@ -108,11 +108,8 @@ fn update_session_binding(
 
 /// 聚合上游 SSE 为非流式 JSON。
 ///
-/// ⭐ P2 修正：除了 `content` 还累加：
-///   - `reasoning_content`（deepseek-reasoner 类模型的推理内容）
-///   - `tool_calls`（按 `index` 合并 delta，拼接 arguments 字符串）
-///
-/// 这样非流式下游才能拿到与流式下游等价的信息。
+/// 累加 `content`、`reasoning_content`、`tool_calls`（按 index 合并），
+/// 保证非流式下游与流式下游拿到等价信息。
 async fn aggregate_sse_to_json(
     resp: wreq::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
@@ -120,7 +117,6 @@ async fn aggregate_sse_to_json(
     let mut buf = Vec::<u8>::new();
     let mut content = String::new();
     let mut reasoning_content = String::new();
-    // tool_calls 按 index 合并（Vec 下标即 OpenAI 的 tool_call.index）
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let mut usage: Option<crate::metrics::UsageInfo> = None;
     let mut id = String::new();
@@ -163,16 +159,13 @@ async fn aggregate_sse_to_json(
                             }
                         }
 
-                        // ⭐ 拿整个 delta 对象，分别处理 content / reasoning / tool_calls
                         if let Some(delta) = v
                             .get("choices")
                             .and_then(|c| c.as_array())
                             .and_then(|a| a.first())
                             .and_then(|c| c.get("delta"))
                         {
-                            if let Some(c) =
-                                delta.get("content").and_then(|c| c.as_str())
-                            {
+                            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
                                 content.push_str(c);
                             }
                             if let Some(rc) = delta
@@ -253,10 +246,7 @@ async fn aggregate_sse_to_json(
         .unwrap_or_default()
         .as_secs();
 
-    // ⭐ P2 修正：finish_reason 语义修正。
-    //    "length" 在 OpenAI 语义里是 token 上限，上游断流用它会误导客户端。
-    //    有 tool_calls → "tool_calls"；否则一律 "stop"（尽力交付已收到的部分）。
-    //    上游中断的事实通过非标准字段 x_upstream_broken 暴露。
+    // 有 tool_calls → "tool_calls"；否则一律 "stop"（不误报 token 上限）。
     let finish_reason = if !tool_calls.is_empty() {
         "tool_calls"
     } else {
@@ -336,29 +326,20 @@ pub async fn chat_completions(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
+    // ⭐ 恢复旧版：session 优先客户端头，否则用时间戳 + counter 生成
     let mut session_id = headers
         .get("x-opencode-session")
         .or_else(|| headers.get("X-Session-Id"))
         .and_then(|v| v.to_str().ok())
         .filter(|s| s.starts_with("ses_") && s.len() == 30)
         .map(String::from)
-        .unwrap_or_else(|| opencode_identity::derive_session_from_messages(&body_json));
-
-    let messages_snapshot: serde_json::Value = body_json
-        .get("messages")
-        .cloned()
-        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        .unwrap_or_else(opencode_identity::generate_session_id);
 
     let bound: Option<Option<String>> = {
         let bindings = state.session_proxy_binding.read().unwrap();
         bindings.get(&session_id).cloned()
     };
 
-    // 注意：preferred_proxy / skip_proxy_loop 只基于「进入本次请求时的绑定」计算。
-    // 如果循环内因 403 触发换 session，这两个值不会重算——但此时已经进入循环，
-    // preferred_proxy 只在 attempt == 0 被消费（已过去），skip_proxy_loop 只影响
-    // 是否进循环（已决定进入）。所以现有行为是正确的，只是依赖「进入时机」。
-    // 如果将来把换 session 逻辑移到循环开始前，需要重新计算这两个值。
     let preferred_proxy: Option<String> = match &bound {
         Some(Some(url)) => {
             if state.pool.is_available(url).await {
@@ -529,19 +510,13 @@ pub async fn chat_completions(
                     if let Some(ref p) = proxy {
                         state.pool.report_banned(p).await;
                     }
+                    // 连续 2 次 403 → 清绑定 + 换一个全新的时间戳 session
                     if freetier_403_count >= 2 {
                         {
                             let mut bindings = state.session_proxy_binding.write().unwrap();
                             bindings.remove(&session_id);
                         }
-                        let seed_body = serde_json::json!({
-                            "model": requested_model,
-                            "messages": messages_snapshot.clone(),
-                        });
-                        let new_session = opencode_identity::derive_session_from_messages_with_nonce(
-                            &seed_body,
-                            freetier_403_count,
-                        );
+                        let new_session = opencode_identity::generate_session_id();
                         warn!(
                             "403 FreeTierError threshold reached; rotating session {} → {}",
                             &session_id[..session_id.len().min(12)],

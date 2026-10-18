@@ -8,9 +8,10 @@ use std::{
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+/// 官方 6 大核心工具
 const OFFICIAL_TOOLS: [&str; 6] = ["bash", "edit", "glob", "grep", "read", "write"];
-const SEED_CONTENT_MAX_CHARS: usize = 200;
 
+/// 每个工具的最小非空 schema
 fn official_tool_schema(name: &str) -> serde_json::Value {
     match name {
         "bash" => serde_json::json!({
@@ -70,9 +71,12 @@ fn tool_description(name: &str) -> &'static str {
     }
 }
 
-/// 独立生成的 session_id，只在「无 messages 且无客户端头」等极端情况使用。
-/// 正常路径走 `derive_session_from_messages`，保持同对话稳定。
-#[allow(dead_code)] // 抓包验证期保留作为回退方案
+/// 对齐 OpenCode CLI Identifier.descending("ses")
+/// 格式：ses_ + 12位hex + 14位Base62，总长30
+///
+/// ⭐ 关键：counter 必须限制在 0–63（`& 0x3F`），确保 12 位 hex 的末三位
+///    落在 fc0–fff。上游会把 12 位 hex 解码成 `~(ts_ms << 12 | counter)`，
+///    如果 counter 超出范围，解码失败 → 判定为非官方客户端 → 403 FreeTierError。
 pub fn generate_session_id() -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -89,24 +93,16 @@ pub fn generate_session_id() -> String {
     format!("ses_{}{}", hex_full, suffix)
 }
 
-/// 生成 request_id。
-///
-/// ⭐ P0 修正：回到基于当前时间戳独立生成。
-///
-///    上一轮根据社区注释把 msg hex 改成「session hex 的按位取反」，
-///    但这会让同一 session 下所有请求的 msg hex 完全相同——真实 CLI 每条
-///    消息的 msg hex 都随时间前进，全相同的模式是极强的指纹。
-///    社区注释 "msg hex 是 session hex 的按位取反" 很可能只描述了首次
-///    创建时的巧合，不是普遍规律。
-pub fn generate_request_id(_session_id: &str) -> String {
+/// 升序消息 ID，前缀 msg_。
+/// 每次调用基于当前时间戳独立生成，不与 session 绑定。
+pub fn generate_request_id() -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed) & 0x3F;
     let raw = ((ts_ms & 0xFFFF_FFFF) << 12) | counter;
-    let inverted = !raw & 0xFFFF_FFFF_FFFF;
-    let hex_full = format!("{:012x}", inverted);
+    let hex_full = format!("{:012x}", raw);
     let mut rng = rand::thread_rng();
     let suffix: String = (0..14)
         .map(|_| BASE62[rng.gen_range(0..62)] as char)
@@ -114,115 +110,15 @@ pub fn generate_request_id(_session_id: &str) -> String {
     format!("msg_{}{}", hex_full, suffix)
 }
 
-fn extract_content_str(content: Option<&serde_json::Value>) -> Option<String> {
-    content.and_then(|c| match c {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(parts) => {
-            let mut buf = String::new();
-            for p in parts {
-                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                    buf.push_str(t);
-                }
-            }
-            if buf.is_empty() {
-                None
-            } else {
-                Some(buf)
-            }
-        }
-        _ => None,
-    })
-}
-
-/// 从 messages 内容哈希派生一个稳定的 session_id（nonce = 0）。
-pub fn derive_session_from_messages(body: &serde_json::Value) -> String {
-    derive_session_from_messages_with_nonce(body, 0)
-}
-
-/// 带 nonce 的派生版本。nonce > 0 时用于 403 FreeTierError 后强制换 session。
+/// 向请求体注入免费层工具契约。
 ///
-/// seed 只用「首条 system + 首条 user 前 200 字符」，保证多轮对话
-/// （messages 增长）和增量客户端（只发新消息）都能保持 session 稳定。
+/// 规则（2026-10-14 之后）：
+/// - tools 必须包含官方 6 大工具：bash, edit, glob, grep, read, write
+/// - 每个工具的 parameters 必须是非空 schema
+/// - tool_choice 必须为 "auto"
 ///
-/// ⭐ P2 修正：当 messages 字段完全缺失时，用纳秒时间戳做一次性种子，
-///    避免一批异常请求（如某些客户端的探测）共享同一个 session。
-pub fn derive_session_from_messages_with_nonce(
-    body: &serde_json::Value,
-    nonce: u32,
-) -> String {
-    let mut seed_parts: Vec<String> = Vec::new();
-    if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
-        seed_parts.push(format!("m:{}", model));
-    }
-    if nonce > 0 {
-        seed_parts.push(format!("n:{}", nonce));
-    }
-
-    let msgs = body.get("messages").and_then(|m| m.as_array());
-    let mut content_found = false;
-
-    if let Some(sys) = msgs.and_then(|a| {
-        a.iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-    }) {
-        if let Some(content) = extract_content_str(sys.get("content")) {
-            seed_parts.push(format!(
-                "sys:{}",
-                content.chars().take(SEED_CONTENT_MAX_CHARS).collect::<String>()
-            ));
-            content_found = true;
-        }
-    }
-
-    if let Some(user) = msgs.and_then(|a| {
-        a.iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-    }) {
-        if let Some(content) = extract_content_str(user.get("content")) {
-            seed_parts.push(format!(
-                "u:{}",
-                content.chars().take(SEED_CONTENT_MAX_CHARS).collect::<String>()
-            ));
-            content_found = true;
-        }
-    }
-
-    if !content_found && msgs.is_none() {
-        // messages 完全缺失：用纳秒作为一次性种子，避免一批探测请求共享 ses_
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        seed_parts.push(format!("nanos:{}", nanos));
-    } else if !content_found {
-        if let Some(a) = msgs {
-            seed_parts.push(format!("len:{}", a.len()));
-        }
-    }
-
-    let seed = seed_parts.join("\x00");
-
-    // FNV-1a 64-bit
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in seed.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-
-    let hex_part = format!("{:012x}", hash & 0xFFFF_FFFF_FFFF);
-
-    let mut state = hash;
-    let mut suffix = String::with_capacity(14);
-    for _ in 0..14 {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        suffix.push(BASE62[(state >> 33) as usize % 62] as char);
-    }
-
-    format!("ses_{}{}", hex_part, suffix)
-}
-
+/// 注意：不再注入 permission 字段。旧版（能工作的版本）没有这个字段，
+/// 之前为对齐社区推测加的 `permission: {"*": "ask"}` 已移除。
 pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -232,6 +128,7 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         return;
     };
 
+    // 1) 收集客户端已传的工具名 → 工具对象
     let mut existing: HashMap<String, serde_json::Value> = HashMap::new();
     for t in arr.drain(..) {
         if let Some(name) = t
@@ -244,6 +141,7 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
+    // 2) 确保 6 大核心工具都在，且 parameters 非空
     for &name in &OFFICIAL_TOOLS {
         let entry = existing.entry(name.to_string()).or_insert_with(|| {
             serde_json::json!({
@@ -270,6 +168,7 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
+    // 3) 客户端额外传入的工具也修复空 schema
     for (name, entry) in existing.iter_mut() {
         if OFFICIAL_TOOLS.contains(&name.as_str()) {
             continue;
@@ -288,7 +187,7 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         }
     }
 
-    // 保持官方工具原始顺序，自定义工具追加在后
+    // 4) 官方工具按原始顺序排列，自定义工具追加在后
     let mut ordered: Vec<serde_json::Value> = Vec::with_capacity(existing.len());
     for &name in &OFFICIAL_TOOLS {
         if let Some(v) = existing.remove(name) {
@@ -300,40 +199,29 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
     }
     *arr = ordered;
 
+    // 5) tool_choice 必须为 auto
     if let Some(obj) = body.as_object_mut() {
         obj.entry("tool_choice")
             .or_insert_with(|| serde_json::json!("auto"));
-
-        // ⭐ P1 修正：改为 insert 强制覆盖。
-        //    免费层下客户端意图不重要，客户端传 permission:{"*":"deny"}
-        //    会导致上游拒绝；强制 ask 比保留 deny 更安全。
-        //
-        //    ⚠️ permission 的确切位置（顶层 vs agent 内）尚未被本地抓包验证。
-        //    如果抓包发现位置不对，把这行删掉或移动到正确层级。
-        //
-        //    注意：serde_json::Map::insert 需要 String 而非 &str，
-        //    这里必须 .to_string()（entry() 有 Into<String> 便利，insert 没有）。
-        obj.insert(
-            "permission".to_string(),
-            serde_json::json!({ "*": "ask" }),
-        );
     }
 }
 
 /// 构造请求头。`session_id` 由调用方决定（同一对话复用），
 /// `request_id` 基于当前时间戳独立生成（每次递增）。
+///
+/// `x-opencode-project` 使用 `prj_0000000000000000`（旧版能工作的值）。
 pub fn apply_headers(
     builder: wreq::RequestBuilder,
     session_id: &str,
 ) -> (wreq::RequestBuilder, String, String) {
-    let request_id = generate_request_id(session_id);
+    let request_id = generate_request_id();
     let builder = builder
         .header("Content-Type", "application/json")
         .header("User-Agent", OPENCODE_UA.as_str())
         .header("x-opencode-client", "cli")
         .header("x-opencode-session", session_id)
         .header("x-opencode-request", request_id.as_str())
-        .header("x-opencode-project", "global")
+        .header("x-opencode-project", "prj_0000000000000000")
         .header("x-session-affinity", session_id)
         .header("X-Session-Id", session_id);
     (builder, session_id.to_string(), request_id)
