@@ -25,6 +25,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-msvc
+          cache-on-failure: true
 
       - name: 编译 Release 版本
         run: cargo build --release --target x86_64-pc-windows-msvc
