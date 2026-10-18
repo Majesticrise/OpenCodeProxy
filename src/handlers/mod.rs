@@ -85,6 +85,27 @@ pub async fn api_toggle(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let size = state.pool.inner.read().await.proxies.len();
-    Json(json!({ "status": "ok", "proxies": size }))
+    use std::sync::atomic::Ordering;
+    let upstream = crate::config::ZEN_UPSTREAM.clone();
+    let snapshot = state.metrics.snapshot();
+    let (total, available, proven, fetching) = {
+        let inner = state.pool.inner.read().await;
+        let now = std::time::Instant::now();
+        (
+            inner.proxies.len(),
+            inner.proxies.iter().filter(|p| p.available(now)).count(),
+            inner
+                .proxies
+                .iter()
+                .filter(|p| p.available(now) && p.success_count > 0)
+                .count(),
+            state.pool.is_fetching.load(Ordering::Relaxed),
+        )
+    };
+    Json(json!({
+        "status": "ok",
+        "proxies": { "total": total, "available": available, "proven": proven, "fetching": fetching },
+        "upstream": upstream,
+        "metrics": { "success_rate_1h": snapshot.success_rate, "p95_latency_1h": snapshot.p95_latency },
+    }))
 }

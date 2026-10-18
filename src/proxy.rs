@@ -37,6 +37,8 @@ pub struct ProxyEntry {
     pub cooldown_until: Option<Instant>,
     pub fail_count: u32,
     pub last_success: Option<Instant>,
+    /// 累计请求成功次数。优先复用该值高的代理，避免每次盲选反复重试。
+    pub success_count: u32,
 }
 
 impl ProxyEntry {
@@ -47,6 +49,7 @@ impl ProxyEntry {
             cooldown_until: None,
             fail_count: 0,
             last_success: None,
+            success_count: 0,
         }
     }
 
@@ -442,9 +445,21 @@ impl ProxyPool {
             return None;
         }
 
-        let limit = std::cmp::min(15, available.len());
-        let slice = &available[..limit];
-        slice.choose(&mut rand::thread_rng()).map(|x| x.url.clone())
+        // 「成功数优先」仅从已验证稳定工作的节点中随机选择；无成功记录时，
+        // 在少量最快节点中冷启动盲选，加速首轮代理验证。
+        let proven: Vec<&ProxyEntry> = available.iter().filter(|p| p.success_count > 0).collect();
+        if proven.is_empty() {
+            let limit = std::cmp::min(15, available.len());
+            let slice = &available[..limit];
+            slice
+                .choose(&mut rand::thread_rng())
+                .map(|p| p.url.clone())
+        } else {
+            proven
+                .iter()
+                .choose(&mut rand::thread_rng())
+                .map(|p| p.url.clone())
+        }
     }
 
     /// 检查某个 URL 对应的代理当前是否可用（存在于池中且未处于冷却）。
@@ -477,6 +492,7 @@ impl ProxyPool {
         if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
             entry.fail_count = 0;
             entry.cooldown_until = None;
+            entry.success_count = entry.success_count.saturating_add(1);
             entry.last_success = Some(Instant::now());
         }
     }
