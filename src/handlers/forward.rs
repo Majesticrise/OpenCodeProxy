@@ -73,6 +73,7 @@ async fn get_or_build_client(
     state.client_cache.insert(proxy.clone(), c.clone());
     Ok(c)
 }
+
 async fn pick_unused_proxy(
     state: &AppState,
     tried: &std::collections::HashSet<String>,
@@ -86,7 +87,6 @@ async fn pick_unused_proxy(
     }
     None
 }
-
 
 async fn aggregate_sse_to_json(
     resp: wreq::Response,
@@ -191,6 +191,7 @@ async fn aggregate_sse_to_json(
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body_bytes: bytes::Bytes,
 ) -> impl IntoResponse {
     use crate::metrics::{try_extract_usage_from_chunk, MetricsGuard, TrackerState};
@@ -229,14 +230,24 @@ pub async fn chat_completions(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
+    // ⭐ 稳定 session：优先客户端头，否则用 messages 哈希派生
+    let session_id = headers
+        .get("x-opencode-session")
+        .or_else(|| headers.get("X-Session-Id"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| s.starts_with("ses_") && s.len() == 30)
+        .map(String::from)
+        .unwrap_or_else(|| opencode_identity::derive_session_from_messages(&body_json));
+
     let routing_snapshot = state.routing.read().unwrap().clone();
     let candidates = resolve_candidates(&routing_snapshot, &requested_model);
     let enable_fallback = routing_snapshot.enable_fallback_chain;
 
     info!(
-        "→ {} model={} (downstream_stream={})",
+        "→ {} model={} session={} (downstream_stream={})",
         if downstream_stream { "STREAM" } else { "SYNC  " },
         requested_model,
+        &session_id[..session_id.len().min(12)],
         downstream_stream
     );
 
@@ -299,8 +310,8 @@ pub async fn chat_completions(
 
         let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
 
-        let (builder, session_id, request_id) = if *INJECT_FREE_TIER_HEADERS {
-            opencode_identity::apply_headers(client.post(&target_url))
+        let (builder, _, request_id) = if *INJECT_FREE_TIER_HEADERS {
+            opencode_identity::apply_headers(client.post(&target_url), &session_id)
         } else {
             (
                 client
@@ -357,7 +368,7 @@ pub async fn chat_completions(
 
                 if code == 403 && body_str.contains("FreeTierError") {
                     warn!(
-                        "Proxy {:?} hit 403 FreeTierError. Banning for 15min; will retry with new session.",
+                        "Proxy {:?} hit 403 FreeTierError. Banning for 15min; will retry with same session.",
                         proxy
                     );
                     if let Some(ref p) = proxy {
@@ -454,7 +465,7 @@ pub async fn chat_completions(
             };
             let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
             let (builder, _, _) = if *INJECT_FREE_TIER_HEADERS {
-                opencode_identity::apply_headers(client.post(&target_url))
+                opencode_identity::apply_headers(client.post(&target_url), &session_id)
             } else {
                 (
                     client
@@ -570,12 +581,6 @@ pub async fn chat_completions(
     // ⭐ 关键修复：用 stream::unfold 显式管理状态。
     //   上游流断裂时 reqwest 会反复返回 Err，必须只处理一次并结束流，
     //   否则会刷屏日志 + 发出成百上千个 [DONE]，让客户端无法解析。
-    //
-    //   状态三元组：
-    //     - done：是否已经处理过错误 → true 后立即返回 None 结束流
-    //     - received_any：是否已收到过有效 chunk
-    //     - 首次 Err 且 !received_any → 发 error event + [DONE]（让客户端知道失败原因）
-    //     - 首次 Err 且 received_any  → 发 [DONE]（正常结束已开始的流）
     let byte_stream = resp.bytes_stream();
 
     let stream = stream::unfold(
@@ -631,8 +636,6 @@ pub async fn chat_completions(
                 }
                 Some(Err(e)) => {
                     let body: bytes::Bytes = if !received_any {
-                        // 一个字节都没收到就失败 → 发一个 OpenAI 兼容的 error 事件，
-                        // 让客户端能展示错误提示，而不是 "no choices"
                         let err_json = serde_json::json!({
                             "error": {
                                 "type": "proxy_upstream_error",

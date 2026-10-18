@@ -102,6 +102,62 @@ pub fn generate_request_id() -> String {
     format!("msg_{}{}", hex_full, suffix)
 }
 
+/// 从 messages 内容哈希派生一个稳定的 session_id。
+///
+/// 种子 = model + messages[0..2]（role + content）。
+/// 同一对话首条 system / user 不变 → session 不变；
+/// 不同对话首条消息不同 → session 不同。
+/// 格式与 `generate_session_id` 一致：ses_ + 12位hex + 14位Base62。
+pub fn derive_session_from_messages(body: &serde_json::Value) -> String {
+    let mut seed_parts: Vec<String> = Vec::new();
+    if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
+        seed_parts.push(model.to_string());
+    }
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs.iter().take(2) {
+            if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                seed_parts.push(role.to_string());
+            }
+            if let Some(content) = msg.get("content") {
+                match content {
+                    serde_json::Value::String(s) => seed_parts.push(s.clone()),
+                    serde_json::Value::Array(parts) => {
+                        for p in parts {
+                            if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                seed_parts.push(t.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let seed = seed_parts.join("\x00");
+
+    // FNV-1a 64-bit
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in seed.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    // 取低 48 位 → 12 位 hex（与 CLI 的 descending 编码长度对齐）
+    let hex_part = format!("{:012x}", hash & 0xFFFF_FFFF_FFFF);
+
+    // 用同一 hash 展开 14 位 Base62 后缀（LCG）
+    let mut state = hash;
+    let mut suffix = String::with_capacity(14);
+    for _ in 0..14 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        suffix.push(BASE62[(state >> 33) as usize % 62] as char);
+    }
+
+    format!("ses_{}{}", hex_part, suffix)
+}
+
 // ⭐ 关键修复：补回丢失的函数头
 pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
     let Some(obj) = body.as_object_mut() else {
@@ -178,19 +234,20 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
     }
 }
 
+/// 构造请求头。`session_id` 由调用方决定（同一对话复用），`request_id` 每次递增。
 pub fn apply_headers(
     builder: wreq::RequestBuilder,
+    session_id: &str,
 ) -> (wreq::RequestBuilder, String, String) {
-    let session_id = generate_session_id();
     let request_id = generate_request_id();
     let builder = builder
         .header("Content-Type", "application/json")
         .header("User-Agent", OPENCODE_UA.as_str())
         .header("x-opencode-client", "cli")
-        .header("x-opencode-session", session_id.as_str())
+        .header("x-opencode-session", session_id)
         .header("x-opencode-request", request_id.as_str())
         .header("x-opencode-project", "prj_0000000000000000")
-        .header("x-session-affinity", session_id.as_str())
-        .header("X-Session-Id", session_id.as_str());
-    (builder, session_id, request_id)
+        .header("x-session-affinity", session_id)
+        .header("X-Session-Id", session_id);
+    (builder, session_id.to_string(), request_id)
 }
