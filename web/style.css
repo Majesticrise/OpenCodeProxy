@@ -632,3 +632,6 @@ select:focus { border-color: var(--accent); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+
+.model-chip.paid { opacity: 0.45; cursor: not-allowed; }
+.model-chip.paid:hover { background: var(--bg-2); color: var(--text-dim); }

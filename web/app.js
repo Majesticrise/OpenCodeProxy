@@ -37,6 +37,16 @@ function toast(msg, kind = '') {
     el._t = setTimeout(() => el.classList.remove('show'), 2600);
 }
 
+// ── 免费模型判定 ──
+// 上游 /v1/models 不返回价格字段，只能靠后缀 + 白名单判断。
+// `big-pickle` 没有 -free 后缀，但输入输出及缓存价格均为零。
+const FREE_WHITELIST = new Set(['big-pickle']);
+
+function isFreeModel(id) {
+    if (!id) return false;
+    return FREE_WHITELIST.has(id) || /-free$/.test(id);
+}
+
 const state = {
     view: 'dashboard',
     status: null,
@@ -67,6 +77,9 @@ function switchView(name) {
     } else if (name === 'routing') {
         loadRouting();
         loadUpstreamModels();
+    } else if (name === 'playground') {
+        // 每次进入 Playground 时刷新免费模型列表，跟上上游轮换
+        loadModels();
     }
 }
 
@@ -346,13 +359,23 @@ async function loadUpstreamModels(forceRefresh = false) {
         box.innerHTML = '<div class="empty">点击"刷新上游列表"获取</div>';
         return;
     }
-    box.innerHTML = state.upstreamModels.map((m) => `
-        <span class="model-chip" data-model="${escapeHtml(m)}" title="点击添加为规则">
+    box.innerHTML = state.upstreamModels.map((m) => {
+        const free = isFreeModel(m);
+        const tip = free ? '点击添加为规则' : '付费模型，不在免费层范围内';
+        return `
+        <span class="model-chip ${free ? '' : 'paid'}"
+              data-model="${escapeHtml(m)}"
+              data-free="${free}"
+              title="${tip}">
             ${escapeHtml(m)}
-        </span>
-    `).join('');
+        </span>`;
+    }).join('');
     box.querySelectorAll('.model-chip').forEach((el) => {
         el.addEventListener('click', () => {
+            if (el.dataset.free !== 'true') {
+                toast('付费模型不在免费层范围内', 'err');
+                return;
+            }
             const m = el.dataset.model;
             if (state.routeRows.length === 0) {
                 state.routeRows.push({ key: m, candidates: m });
@@ -464,15 +487,56 @@ async function saveRouting() {
 }
 
 // ── Playground ──
+// 模型来源优先级：
+//   1. /api/upstream/models（实时目录，自动跟随上游轮换）
+//   2. /v1/models（routing 映射或后端兜底列表）
+//   3. 硬编码兜底（前两个都失败时）
+// 无论哪条路径，最终都按 isFreeModel() 过滤，只保留免费模型。
 async function loadModels() {
+    let allModels = [];
+
+    // 1) 实时上游目录
     try {
-        const r = await fetch('/v1/models');
+        const r = await fetch('/api/upstream/models');
         const d = await r.json();
-        state.models = d.data || [];
-    } catch (_) {
-        state.models = [{ id: 'deepseek-v4-flash-free' }];
+        if (Array.isArray(d.models) && d.models.length > 0) {
+            allModels = d.models;
+        }
+    } catch (_) {}
+
+    // 2) 回退到 /v1/models（routing 映射或后端硬编码）
+    if (allModels.length === 0) {
+        try {
+            const r = await fetch('/v1/models');
+            const d = await r.json();
+            allModels = (d.data || []).map((m) => m.id).filter(Boolean);
+        } catch (_) {}
     }
+
+    // 3) 最终兜底
+    if (allModels.length === 0) {
+        allModels = ['big-pickle', 'mimo-v2.6-flash-free'];
+    }
+
+    // 过滤免费模型，去重，保持顺序
+    const seen = new Set();
+    const freeModels = [];
+    for (const id of allModels) {
+        if (!isFreeModel(id)) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        freeModels.push(id);
+    }
+
+    // 兜底列表如果也被过滤空了（极端情况），至少给一个
+    if (freeModels.length === 0) {
+        freeModels.push('big-pickle');
+    }
+
+    state.models = freeModels.map((id) => ({ id }));
+
     const sel = $('#pgModel');
+    if (!sel) return;
     const prev = sel.value;
     sel.innerHTML = state.models
         .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`)
