@@ -310,7 +310,13 @@ pub fn inject_free_tier_tools(body: &mut serde_json::Value) {
         //
         //    ⚠️ permission 的确切位置（顶层 vs agent 内）尚未被本地抓包验证。
         //    如果抓包发现位置不对，把这行删掉或移动到正确层级。
-        obj.insert("permission", serde_json::json!({ "*": "ask" }));
+        //
+        //    注意：serde_json::Map::insert 需要 String 而非 &str，
+        //    这里必须 .to_string()（entry() 有 Into<String> 便利，insert 没有）。
+        obj.insert(
+            "permission".to_string(),
+            serde_json::json!({ "*": "ask" }),
+        );
     }
 }
 
