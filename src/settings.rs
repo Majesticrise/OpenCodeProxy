@@ -25,8 +25,11 @@ pub struct RuntimeSettings {
     pub mode: Mode,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 实名模式下的 Console org id（`org_...`）。
+    /// 当前 `forward.rs` 优先从环境变量 `OPENCODE_ORG_ID` 读取；
+    /// 这里保留字段是为了将来支持在 WebUI 里配置并落盘。
     #[serde(default)]
-    pub org_id: Option<String>, // 新增
+    pub org_id: Option<String>,
 }
 
 impl RuntimeSettings {
@@ -34,12 +37,20 @@ impl RuntimeSettings {
         let path = &*SETTINGS_FILE;
         match std::fs::read_to_string(path) {
             Ok(content) => match serde_json::from_str::<RuntimeSettings>(&content) {
-                Ok(s) => {
+                Ok(mut s) => {
+                    // 环境变量优先：如果设置了 `OPENCODE_ORG_ID`，覆盖文件里的值
+                    if let Ok(env_org) = std::env::var("OPENCODE_ORG_ID") {
+                        let env_org = env_org.trim().to_string();
+                        if !env_org.is_empty() {
+                            s.org_id = Some(env_org);
+                        }
+                    }
                     info!(
-                        "Loaded settings from {}: mode={:?}, api_key={}",
+                        "Loaded settings from {}: mode={:?}, api_key={}, org_id={}",
                         path,
                         s.mode,
-                        if s.api_key.is_some() { "set" } else { "none" }
+                        if s.api_key.is_some() { "set" } else { "none" },
+                        if s.org_id.is_some() { "set" } else { "none" }
                     );
                     s
                 }
@@ -81,6 +92,7 @@ impl RuntimeSettings {
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +124,7 @@ mod tests {
         let s = RuntimeSettings {
             mode: Mode::Anonymous,
             api_key: Some("sk-1234567890abcdef".to_string()),
+            org_id: None,
         };
         assert_eq!(s.masked_api_key(), Some("sk-1...cdef".to_string()));
     }
@@ -121,6 +134,7 @@ mod tests {
         let s = RuntimeSettings {
             mode: Mode::Anonymous,
             api_key: Some("short".to_string()),
+            org_id: None,
         };
         assert_eq!(s.masked_api_key(), Some("***".to_string()));
     }
@@ -136,18 +150,33 @@ mod tests {
         let original = RuntimeSettings {
             mode: Mode::Authenticated,
             api_key: Some("sk-test".to_string()),
+            org_id: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: RuntimeSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.mode, Mode::Authenticated);
         assert_eq!(restored.api_key, Some("sk-test".to_string()));
+        assert_eq!(restored.org_id, None);
+    }
+
+    #[test]
+    fn settings_roundtrip_with_org_id() {
+        let original = RuntimeSettings {
+            mode: Mode::Authenticated,
+            api_key: Some("oc_sk_test".to_string()),
+            org_id: Some("org_abc123".to_string()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: RuntimeSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.org_id, Some("org_abc123".to_string()));
     }
 
     #[test]
     fn settings_deserializes_missing_fields() {
-        // 空 JSON 应该得到默认值（无 key、匿名模式）
+        // 空 JSON 应该得到默认值（无 key、无 org、匿名模式）
         let s: RuntimeSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.mode, Mode::Anonymous);
         assert_eq!(s.api_key, None);
+        assert_eq!(s.org_id, None);
     }
 }
