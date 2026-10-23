@@ -95,13 +95,16 @@ async fn main() {
     };
     let metrics = Arc::new(MetricsStore::with_persistence(metrics_path));
 
-    let metrics_for_flush = metrics.clone();
+    // 定时 flush 任务持有自己的一份克隆（async move 会拿走所有权）；
+    // `metrics_for_flush` 单独克隆一份，留给停机时的 flush_blocking 用。
+    let metrics_flusher = metrics.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            metrics_for_flush.flush_if_dirty().await;
+            metrics_flusher.flush_if_dirty().await;
         }
     });
+    let metrics_for_flush = metrics.clone();
 
     // ── AppState ──
     let state = AppState {
