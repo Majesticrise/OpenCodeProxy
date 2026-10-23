@@ -21,13 +21,13 @@
 | 🔐 | **免费层身份伪装** | 完整模拟 OpenCode CLI 的 UA、Session ID、项目 ID、工具契约 |
 | 🎭 | **Session ID 精确对齐** | 复刻 `Identifier.descending("ses")` 编码，counter 严格落在 0–63 窗口 |
 | 🛠️ | **6 大官方工具注入** | 自动补全 `bash` / `edit` / `glob` / `grep` / `read` / `write`，字母序排列 |
-| 🔄 | **代理池自管理** | 从 12+ 公共源自动抓取 → 并发验证 → 失败冷却 → 成功复位 |
+| 🔄 | **代理池自管理** | 从 10 个公共源自动抓取 → 并发验证 → 失败冷却 → 成功复位 |
 | 🚦 | **智能失败分级** | 429 短冷却 / 连接失败长冷却 / 403 风控 15 分钟冷却 |
 | 🧭 | **模型路由与 fallback** | 客户端模型名 → 上游候选列表，模型不可用时自动切换下一个 |
 | ⚡ | **流式 / 非流式自适应** | 上游永远流式（伪装要求），下游非流式时网关内自动聚合 |
 | 📊 | **实时指标持久化** | 总请求数、成功率、Token 用量跨重启累计，P95 延迟实时计算 |
 | 🖥️ | **内置 WebUI** | 仪表盘 / 实时日志 / Playground / 路由配置，零额外部署 |
-| 🔌 | **连接池复用** | `DashMap` 按代理 URL 缓存 `reqwest::Client`，TLS 握手不重复 |
+| 🔌 | **连接池复用** | `DashMap` 按代理 URL 缓存 `wreq::Client`（Chrome131 TLS 指纹模拟），超量自动清理 |
 
 ---
 
@@ -144,7 +144,7 @@ curl http://localhost:8910/v1/chat/completions \
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `PROXY_FILE` | `proxies.txt` | 本地代理列表（存在时优先使用，跳过网络抓取） |
-| `VALIDATE_TARGET` | `https://opencode.ai` | 代理验证的探测目标 |
+| `VALIDATE_TARGET` | `https://opencode.ai/zen/v1/models` | 代理验证 / 上游模型探测的目标 |
 | `MIN_POOL_SIZE` | `10` | 池内代理低于该阈值时自动补货 |
 
 `proxies.txt` 格式（每行一条，`#` 开头为注释）：
@@ -180,6 +180,15 @@ MODEL_OVERRIDE=glm-5.3-flash-free ./zen-proxy
 # 客户端请求 my-model 时优先 glm-5.3-flash-free，失败切 nemotron-3.5-lightning-free
 MODEL_MAPPING="my-model:glm-5.3-flash-free|nemotron-3.5-lightning-free" ./zen-proxy
 ```
+
+### 运行模式（匿名 / 实名）
+
+WebUI 顶栏滑动开关热切换，无需重启：
+
+- **匿名（默认）**：代理池 + 免费层身份伪装，不带 API Key。
+- **实名**：跳过代理池直连 + API Key 鉴权（`Authorization: Bearer`），保留伪装头。
+  - Key 在 WebUI「API Key」页配置，明文存于本地 `settings.json`（仅限本机使用）
+  - 可选环境变量 `OPENCODE_ORG_ID` 附加 `x-opencode-org-id` 头（不落盘，优先级高于文件）
 
 ### 指标持久化
 
@@ -226,6 +235,15 @@ MODEL_MAPPING="my-model:glm-5.3-flash-free|nemotron-3.5-lightning-free" ./zen-pr
 - 支持 `*` 通配兜底
 - 保存后**热生效**，无需重启
 
+### API Key 与运行模式
+
+- 顶栏匿名/实名滑动开关（实名需先配置 Key）
+- API Key 的设置 / 清除（脱敏展示，落盘 `settings.json`）
+
+### 配置
+
+- 只读运行配置与客户端接入说明
+
 ---
 
 ## 🏗️ 项目结构
@@ -239,6 +257,7 @@ zen-proxy/
 │   ├── logger.rs                # 自定义 tracing Layer，写入 Web 缓冲
 │   ├── metrics.rs               # 指标采集 + 持久化 + MetricsGuard RAII
 │   ├── middleware.rs            # 剥离 Authorization
+│   ├── settings.rs              # 运行时设置（匿名/实名模式 + API Key）
 │   ├── opencode_identity.rs     # ⭐ 免费层身份伪装（Session / UA / Tools）
 │   ├── proxy.rs                 # ⭐ 代理池：抓取、验证、冷却、重选
 │   └── handlers/
@@ -246,6 +265,7 @@ zen-proxy/
 │       ├── forward.rs           # ⭐ 核心转发 + fallback chain + SSE 聚合
 │       ├── models.rs            # /v1/models
 │       ├── routing.rs           # /api/routing 读写
+│       ├── settings.rs          # /api/settings/* 模式与密钥管理
 │       └── upstream.rs          # /api/upstream/* 探测与缓存
 └── web/
     ├── index.html               # 单页多视图
@@ -291,9 +311,9 @@ zen-proxy/
 ```
 可用 ←─ report_success ←─ 请求成功
   │
-  ├─ report_rate_limit → 冷却 30s
-  ├─ report_failure    → 冷却 300s，累计失败 3 次移除
-  └─ report_banned     → 冷却 900s，不累计失败
+  ├─ report_rate_limit → 冷却 30s，不计失败
+  ├─ report_failure    → 冷却 300s，累计失败 5 次移除
+  └─ report_banned     → 冷却 900s，累计 10 次移除
 ```
 
 ---
@@ -317,6 +337,9 @@ zen-proxy/
 | `GET` | `/api/logs` | 日志缓冲 |
 | `POST` | `/api/toggle` | 启停代理服务 |
 | `GET/POST` | `/api/routing` | 读取/写入模型路由配置 |
+| `GET` | `/api/settings` | 读取运行模式与密钥状态（脱敏） |
+| `POST` | `/api/settings/mode` | 切换匿名/实名模式 |
+| `POST` | `/api/settings/apikey` | 设置/清除 API Key |
 | `GET` | `/api/upstream/models` | 缓存的上游模型列表 |
 | `POST` | `/api/upstream/refresh` | 主动探测上游并刷新缓存 |
 
@@ -361,8 +384,8 @@ PERSIST_METRICS=false ./zen-proxy
 
 ## ⚠️ 已知限制
 
-1. **TLS 指纹**：`reqwest + rustls` 的 ClientHello 指纹与官方 Bun 客户端不同。若上游升级到 TLS 层校验，可能需要改用 `native-tls` 或更底层的方案。
-2. **Session 一致性**：当前每次请求生成新 session。若上游要求"同一对话必须同一 session"，需要按对话 ID 维持亲和性。
+1. **TLS 指纹**：已改用 `wreq`（Chrome 131 TLS/HTTP2 指纹模拟），浏览器指纹不一致的问题已解决；若上游未来针对指纹做更细的校验，需跟进 `wreq-util` 的 Profile。
+2. **Session 一致性**：客户端可通过 `x-opencode-session` / `X-Session-Id` 头传入会话 ID 复用（格式不符时自动生成），网关同时维护 session → 代理/直连的亲和绑定。若上游要求"同一对话必须同一 session"，需要按对话 ID 维持亲和性。
 3. **免费层规则变化**：Zen 的校验规则会随时间演进，本项目会持续跟进。
 4. **代理 IP 暴露**：免费代理可能通过 `X-Forwarded-For` 泄露你的真实 IP。敏感场景请使用 VPN 前置或高匿代理。
 

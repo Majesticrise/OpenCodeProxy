@@ -65,12 +65,32 @@ fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
     (total_chars / 3).max(1)
 }
 
+/// 客户端缓存软上限：代理池上限（proxy.rs 的 MAX_POOL_SIZE=120）+ 换血期间的临时余量。
+const CLIENT_CACHE_SOFT_CAP: usize = 150;
+
 async fn get_or_build_client(
     state: &AppState,
     proxy: &Option<String>,
 ) -> Result<wreq::Client, wreq::Error> {
     if let Some(c) = state.client_cache.get(proxy).map(|v| v.clone()) {
         return Ok(c);
+    }
+    // 池子换血后被移除代理的 Client 会一直滞留在缓存里，这里做清理：
+    // 超过软上限时，淘汰「已不在代理池中」的 URL 对应条目；直连（None）保留。
+    if state.client_cache.len() >= CLIENT_CACHE_SOFT_CAP {
+        let keys: Vec<Option<String>> =
+            state.client_cache.iter().map(|e| e.key().clone()).collect();
+        let mut stale = Vec::new();
+        for k in keys {
+            if let Some(url) = &k {
+                if !state.pool.contains(url).await {
+                    stale.push(k);
+                }
+            }
+        }
+        for k in stale {
+            state.client_cache.remove(&k);
+        }
     }
     let mut b = wreq::Client::builder()
         .emulation(impersonate())
@@ -119,107 +139,119 @@ fn update_session_binding(
     bindings.insert(session_id.to_string(), proxy);
 }
 
+/// SSE 事件聚合的中间状态（上游强制流式，非流式客户端由网关聚合回 JSON）。
+#[derive(Default)]
+struct SseAgg {
+    content: String,
+    reasoning_content: String,
+    tool_calls: Vec<serde_json::Value>,
+    usage: Option<crate::metrics::UsageInfo>,
+    id: String,
+    model: String,
+}
+
+/// 把一条已解析的 `data: {...}` 事件合并进聚合状态。
+/// 单独成函数是为了让「流结束后没有换行符的最后一行」复用同一条路径，也便于单测。
+fn apply_sse_event(v: &serde_json::Value, agg: &mut SseAgg) {
+    if agg.id.is_empty() {
+        if let Some(i) = v.get("id").and_then(|i| i.as_str()) {
+            agg.id = i.to_string();
+        }
+    }
+    if agg.model.is_empty() {
+        if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+            agg.model = m.to_string();
+        }
+    }
+    if let Some(u) = v.get("usage") {
+        if !u.is_null() {
+            agg.usage = Some(crate::metrics::UsageInfo::from_json(u));
+        }
+    }
+    if let Some(delta) = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("delta"))
+    {
+        if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+            agg.content.push_str(c);
+        }
+        if let Some(rc) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+            agg.reasoning_content.push_str(rc);
+        }
+        if let Some(tc_arr) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in tc_arr {
+                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                while agg.tool_calls.len() <= idx {
+                    agg.tool_calls.push(json!({
+                        "id": "",
+                        "type": "function",
+                        "function": { "name": "", "arguments": "" }
+                    }));
+                }
+                if let Some(cid) = tc.get("id").and_then(|i| i.as_str()) {
+                    if !cid.is_empty() {
+                        agg.tool_calls[idx]["id"] = json!(cid);
+                    }
+                }
+                if let Some(name) = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    if !name.is_empty() {
+                        agg.tool_calls[idx]["function"]["name"] = json!(name);
+                    }
+                }
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                {
+                    let prev = agg.tool_calls[idx]["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    agg.tool_calls[idx]["function"]["arguments"] =
+                        json!(format!("{}{}", prev, args));
+                }
+            }
+        }
+    }
+}
+
+/// 解析并合并一行 SSE 文本；`data:` 前缀之外的行（注释 / 空行 / 其他）安全忽略。
+fn merge_sse_line(line: &str, agg: &mut SseAgg) {
+    let line = line.trim();
+    let json_str = if let Some(s) = line.strip_prefix("data:") {
+        s.trim_start()
+    } else {
+        return;
+    };
+    if json_str.is_empty() || json_str == "[DONE]" {
+        return;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+        apply_sse_event(&v, agg);
+    }
+}
+
 async fn aggregate_sse_to_json(
     resp: wreq::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::<u8>::new();
-    let mut content = String::new();
-    let mut reasoning_content = String::new();
-    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-    let mut usage: Option<crate::metrics::UsageInfo> = None;
-    let mut id = String::new();
-    let mut model = String::new();
+    let mut agg = SseAgg::default();
     let mut broke_midway = false;
 
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
                 buf.extend_from_slice(&chunk);
-                let mut start = 0;
-                while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
-                    let end = start + pos;
-                    let line = String::from_utf8_lossy(&buf[start..end]).to_string();
-                    start = end + 1;
-                    let line = line.trim();
-                    let json_str = if let Some(s) = line.strip_prefix("data:") {
-                        s.trim_start()
-                    } else {
-                        continue;
-                    };
-                    if json_str.is_empty() || json_str == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if id.is_empty() {
-                            if let Some(i) = v.get("id").and_then(|i| i.as_str()) {
-                                id = i.to_string();
-                            }
-                        }
-                        if model.is_empty() {
-                            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
-                                model = m.to_string();
-                            }
-                        }
-                        if let Some(u) = v.get("usage") {
-                            if !u.is_null() {
-                                usage = Some(crate::metrics::UsageInfo::from_json(u));
-                            }
-                        }
-                        if let Some(delta) = v
-                            .get("choices")
-                            .and_then(|c| c.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|c| c.get("delta"))
-                        {
-                            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
-                                content.push_str(c);
-                            }
-                            if let Some(rc) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-                                reasoning_content.push_str(rc);
-                            }
-                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                                for tc in tc_arr {
-                                    let idx =
-                                        tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                                    while tool_calls.len() <= idx {
-                                        tool_calls.push(json!({
-                                            "id": "",
-                                            "type": "function",
-                                            "function": { "name": "", "arguments": "" }
-                                        }));
-                                    }
-                                    if let Some(cid) = tc.get("id").and_then(|i| i.as_str()) {
-                                        if !cid.is_empty() {
-                                            tool_calls[idx]["id"] = json!(cid);
-                                        }
-                                    }
-                                    if let Some(name) = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(|n| n.as_str())
-                                    {
-                                        if !name.is_empty() {
-                                            tool_calls[idx]["function"]["name"] = json!(name);
-                                        }
-                                    }
-                                    if let Some(args) = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("arguments"))
-                                        .and_then(|a| a.as_str())
-                                    {
-                                        let prev =
-                                            tool_calls[idx]["function"]["arguments"].as_str().unwrap_or("");
-                                        tool_calls[idx]["function"]["arguments"] =
-                                            json!(format!("{}{}", prev, args));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if start > 0 {
-                    buf.drain(..start);
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                    merge_sse_line(&String::from_utf8_lossy(&line_bytes), &mut agg);
                 }
             }
             Some(Err(e)) => {
@@ -231,7 +263,12 @@ async fn aggregate_sse_to_json(
         }
     }
 
-    if broke_midway && content.is_empty() && id.is_empty() && tool_calls.is_empty() {
+    // 收尾：流结束后缓冲里可能残留最后一行（上游没以换行结尾），同样要合并
+    if !buf.is_empty() {
+        merge_sse_line(&String::from_utf8_lossy(&buf), &mut agg);
+    }
+
+    if broke_midway && agg.content.is_empty() && agg.id.is_empty() && agg.tool_calls.is_empty() {
         return Err("upstream stream broke before any data".to_string());
     }
 
@@ -240,34 +277,38 @@ async fn aggregate_sse_to_json(
         .unwrap_or_default()
         .as_secs();
 
-    let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
+    let finish_reason = if !agg.tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
 
-    let mut message = json!({ "role": "assistant", "content": content });
-    if !reasoning_content.is_empty() {
-        message["reasoning_content"] = json!(reasoning_content);
+    let mut message = json!({ "role": "assistant", "content": agg.content });
+    if !agg.reasoning_content.is_empty() {
+        message["reasoning_content"] = json!(agg.reasoning_content);
     }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = json!(tool_calls);
+    if !agg.tool_calls.is_empty() {
+        message["tool_calls"] = json!(agg.tool_calls);
     }
 
     let mut response_json = json!({
-        "id": if id.is_empty() { format!("chatcmpl-{}", created) } else { id },
+        "id": if agg.id.is_empty() { format!("chatcmpl-{}", created) } else { agg.id.clone() },
         "object": "chat.completion",
         "created": created,
-        "model": if model.is_empty() { "unknown" } else { &model },
+        "model": if agg.model.is_empty() { "unknown".to_string() } else { agg.model.clone() },
         "choices": [{
             "index": 0,
             "message": message,
             "finish_reason": finish_reason
         }],
-        "usage": usage
+        "usage": agg.usage
     });
     if broke_midway {
         response_json["x_upstream_broken"] = json!(true);
     }
 
     let bytes = serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
-    Ok((bytes, usage))
+    Ok((bytes, agg.usage))
 }
 
 /// 脱敏密钥用于日志：只显示前 7 位和后 4 位（`oc_sk_` 前缀保留）。
@@ -277,6 +318,67 @@ fn mask_key(key: &str) -> String {
     } else {
         format!("{}...{}", &key[..7], &key[key.len() - 4..])
     }
+}
+
+/// 上游永远以流式请求（免费层伪装要求），并确保 `stream_options.include_usage` 存在。
+/// 客户端已显式设置的字段值不覆盖（例如显式传了 `include_usage: false` 就尊重之），
+/// 只在缺失时补 `true`。此前用 `entry().or_insert_with()` 整体写入，客户端传
+/// `{"stream_options":{}}` 时 `include_usage` 不会被补上，导致拿不到真实 usage。
+fn force_stream_options(body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    obj.remove("variant");
+    obj.insert("stream".to_string(), json!(true));
+    let so = obj.entry("stream_options").or_insert_with(|| json!({}));
+    match so.as_object_mut() {
+        Some(map) => {
+            map.entry("include_usage").or_insert_with(|| json!(true));
+        }
+        None => {
+            *so = json!({ "include_usage": true });
+        }
+    }
+}
+
+/// 构造「计入指标」的错误响应。
+/// 请求一旦通过校验（已计入 pool.total_requests），无论最终成败都必须落一条 metric，
+/// 否则 WebUI 的总请求数 / 成功率会与 /api/status 的 pool 计数口径不一致且偏乐观。
+fn tracked_error_response(
+    state: &AppState,
+    request_start: Instant,
+    model: &str,
+    status: u16,
+    estimated_prompt: u64,
+    content_type: &'static str,
+    body: impl Into<bytes::Bytes>,
+) -> Response {
+    use crate::metrics::{MetricsGuard, TrackerState};
+
+    state
+        .metrics
+        .active_requests
+        .fetch_add(1, Ordering::Relaxed);
+    let tracker = Arc::new(TrackerState::new(
+        request_start,
+        model.to_string(),
+        false,
+        status,
+        estimated_prompt,
+    ));
+    let mut response = Response::new(Body::from(body.into()));
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response.extensions_mut()
+        .insert(Arc::new(MetricsGuard {
+            metrics: state.metrics.clone(),
+            tracker,
+        }));
+    response
 }
 
 pub async fn chat_completions(
@@ -395,12 +497,7 @@ pub async fn chat_completions(
         .fetch_add(1, Ordering::Relaxed);
 
     let mut forward_body = body_json;
-    if let Some(obj) = forward_body.as_object_mut() {
-        obj.remove("variant");
-        obj.insert("stream".to_string(), json!(true));
-        obj.entry("stream_options")
-            .or_insert_with(|| json!({ "include_usage": true }));
-    }
+    force_stream_options(&mut forward_body);
 
     if *INJECT_FREE_TIER_TOOLS {
         opencode_identity::inject_free_tier_tools(&mut forward_body);
@@ -578,12 +675,15 @@ pub async fn chat_completions(
                         if let Some(ref p) = proxy {
                             state.pool.report_failure(p).await;
                         }
-                        return Response::builder()
-                            .status(code)
-                            .header("content-type", "application/json")
-                            .body(Body::from(body_bytes))
-                            .unwrap()
-                            .into_response();
+                        return tracked_error_response(
+                            &state,
+                            request_start,
+                            &model_for_metrics,
+                            code,
+                            estimated_prompt,
+                            "application/json",
+                            body_bytes,
+                        );
                     }
 
                     if first_upstream_error.is_none() {
@@ -604,12 +704,15 @@ pub async fn chat_completions(
                 }
 
                 warn!("Upstream returned {} (non-retryable): {}", code, body_str);
-                return Response::builder()
-                    .status(code)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body_bytes))
-                    .unwrap()
-                    .into_response();
+                return tracked_error_response(
+                    &state,
+                    request_start,
+                    &model_for_metrics,
+                    code,
+                    estimated_prompt,
+                    "application/json",
+                    body_bytes,
+                );
             }
         }
     }
@@ -626,11 +729,15 @@ pub async fn chat_completions(
             let client = match get_or_build_client(&state, &None).await {
                 Ok(c) => c,
                 Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                    return tracked_error_response(
+                        &state,
+                        request_start,
+                        &model_for_metrics,
+                        500,
+                        estimated_prompt,
+                        "text/plain; charset=utf-8",
                         format!("Failed to create direct client: {}", e),
                     )
-                        .into_response()
                 }
             };
             let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
@@ -680,12 +787,15 @@ pub async fn chat_completions(
                             status_code,
                             body_str.chars().take(500).collect::<String>()
                         );
-                        return Response::builder()
-                            .status(status_code)
-                            .header("content-type", "application/json")
-                            .body(Body::from(body))
-                            .unwrap()
-                            .into_response();
+                        return tracked_error_response(
+                            &state,
+                            request_start,
+                            &model_for_metrics,
+                            status_code,
+                            estimated_prompt,
+                            "application/json",
+                            body,
+                        );
                     }
 
                     // 只有匿名模式写回绑定；实名模式总是直连，不写绑定
@@ -700,11 +810,15 @@ pub async fn chat_completions(
                         let mut bindings = state.session_proxy_binding.write().unwrap();
                         bindings.remove(&session_id);
                     }
-                    return (
-                        StatusCode::BAD_GATEWAY,
+                    return tracked_error_response(
+                        &state,
+                        request_start,
+                        &model_for_metrics,
+                        502,
+                        estimated_prompt,
+                        "text/plain; charset=utf-8",
                         format!("Upstream direct connection failed: {}", e),
-                    )
-                        .into_response();
+                    );
                 }
             }
         }
@@ -738,8 +852,15 @@ pub async fn chat_completions(
         let (bytes, usage) = match aggregate_sse_to_json(resp).await {
             Ok(x) => x,
             Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("aggregate failed: {e}"))
-                    .into_response()
+                return tracked_error_response(
+                    &state,
+                    request_start,
+                    &model_for_metrics,
+                    502,
+                    estimated_prompt,
+                    "text/plain; charset=utf-8",
+                    format!("aggregate failed: {e}"),
+                )
             }
         };
 
@@ -800,8 +921,15 @@ pub async fn chat_completions(
     let byte_stream = resp.bytes_stream();
 
     let stream = stream::unfold(
-        (byte_stream, false, false, tracker_for_stream, buf_for_stream),
-        move |(mut inner, done, received_any, tracker, buf)| async move {
+        (
+            byte_stream,
+            false,
+            false,
+            tracker_for_stream,
+            buf_for_stream,
+            Vec::<u8>::new(),
+        ),
+        move |(mut inner, done, received_any, tracker, buf, mut pending)| async move {
             if done {
                 return None;
             }
@@ -815,37 +943,40 @@ pub async fn chat_completions(
                         }
                     }
 
-                    if let Ok(text) = std::str::from_utf8(&chunk) {
-                        for line in text.lines() {
-                            let line = line.trim();
-                            let json_str = if let Some(s) = line.strip_prefix("data:") {
-                                s.trim_start()
-                            } else {
-                                continue;
-                            };
-                            if json_str.is_empty() || json_str == "[DONE]" {
-                                continue;
-                            }
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                if let Some(delta) = v
-                                    .get("choices")
-                                    .and_then(|c| c.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|c| c.get("delta"))
-                                    .and_then(|d| d.get("content"))
-                                    .and_then(|c| c.as_str())
-                                {
-                                    tracker
-                                        .streamed_chars
-                                        .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
-                                }
+                    // 按完整行统计输出字符：SSE 可能把一行 JSON 或一个多字节字符拆在
+                    // 相邻 chunk 里，逐 chunk 解 UTF-8 会整块丢失，先攒行再解析。
+                    pending.extend_from_slice(&chunk);
+                    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let line = line.trim();
+                        let json_str = if let Some(s) = line.strip_prefix("data:") {
+                            s.trim_start()
+                        } else {
+                            continue;
+                        };
+                        if json_str.is_empty() || json_str == "[DONE]" {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            if let Some(delta) = v
+                                .get("choices")
+                                .and_then(|c| c.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|c| c.get("delta"))
+                                .and_then(|d| d.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                tracker
+                                    .streamed_chars
+                                    .fetch_add(delta.chars().count() as u64, Ordering::Relaxed);
                             }
                         }
                     }
 
                     Some((
                         Ok::<_, std::io::Error>(chunk),
-                        (inner, false, true, tracker, buf),
+                        (inner, false, true, tracker, buf, pending),
                     ))
                 }
                 Some(Err(e)) => {
@@ -870,7 +1001,7 @@ pub async fn chat_completions(
                     };
                     Some((
                         Ok::<_, std::io::Error>(body),
-                        (inner, true, received_any, tracker, buf),
+                        (inner, true, received_any, tracker, buf, pending),
                     ))
                 }
                 None => None,
@@ -886,4 +1017,111 @@ pub async fn chat_completions(
         tracker,
     }));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── force_stream_options ──
+
+    #[test]
+    fn force_stream_injects_and_merges() {
+        let mut body = json!({"variant": "x", "stream": false, "stream_options": {}});
+        force_stream_options(&mut body);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("variant").is_none());
+        // 客户端传了空的 stream_options 也必须补上 include_usage
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn force_stream_respects_explicit_include_usage() {
+        let mut body = json!({"stream_options": {"include_usage": false}});
+        force_stream_options(&mut body);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], false);
+    }
+
+    #[test]
+    fn force_stream_on_missing_or_malformed_stream_options() {
+        let mut a = json!({});
+        force_stream_options(&mut a);
+        assert_eq!(a["stream_options"]["include_usage"], true);
+
+        // 非对象的异常值直接重置为合法对象
+        let mut b = json!({"stream_options": "garbage"});
+        force_stream_options(&mut b);
+        assert_eq!(b["stream_options"]["include_usage"], true);
+    }
+
+    // ── SSE 聚合 ──
+
+    #[test]
+    fn merge_sse_line_parses_data_events() {
+        let mut agg = SseAgg::default();
+        let ev = json!({
+            "id": "chatcmpl-1",
+            "model": "m",
+            "choices": [{"delta": {"content": "你好"}}]
+        })
+        .to_string();
+        merge_sse_line(&format!("data: {}", ev), &mut agg);
+        // 空行 / 注释 / [DONE] 都要被安全忽略
+        merge_sse_line("", &mut agg);
+        merge_sse_line(": keep-alive", &mut agg);
+        merge_sse_line("data: [DONE]", &mut agg);
+
+        assert_eq!(agg.content, "你好");
+        assert_eq!(agg.id, "chatcmpl-1");
+        assert_eq!(agg.model, "m");
+        assert!(agg.usage.is_none());
+    }
+
+    #[test]
+    fn merge_sse_line_captures_usage() {
+        let mut agg = SseAgg::default();
+        let ev = json!({
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        })
+        .to_string();
+        merge_sse_line(&format!("data: {}", ev), &mut agg);
+        assert_eq!(agg.usage.unwrap().total_tokens, 3);
+    }
+
+    #[test]
+    fn apply_sse_event_accumulates_tool_calls_across_events() {
+        // tool_calls 的 arguments 会被上游切成多个增量片段，必须按 index 拼接
+        let mut agg = SseAgg::default();
+        apply_sse_event(
+            &json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "read", "arguments": "{\"file"}}
+            ]}}]}),
+            &mut agg,
+        );
+        apply_sse_event(
+            &json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "Path\":\"a\"}"}}
+            ]}}]}),
+            &mut agg,
+        );
+        assert_eq!(agg.tool_calls.len(), 1);
+        assert_eq!(agg.tool_calls[0]["id"], "call_1");
+        assert_eq!(agg.tool_calls[0]["function"]["name"], "read");
+        assert_eq!(
+            agg.tool_calls[0]["function"]["arguments"],
+            json!("{\"filePath\":\"a\"}")
+        );
+    }
+
+    #[test]
+    fn apply_sse_event_reasoning_content() {
+        let mut agg = SseAgg::default();
+        apply_sse_event(
+            &json!({"choices": [{"delta": {"reasoning_content": "hmm"}}]}),
+            &mut agg,
+        );
+        assert_eq!(agg.reasoning_content, "hmm");
+    }
 }

@@ -388,6 +388,8 @@ impl ProxyPool {
             }
         }
 
+        // 未测速（latency <= 0，如刚从 proxies.txt 加载）排在已测速节点之前，
+        // 防止它们被下面的 MAX_POOL_SIZE 截断掉；冷启动选择见 get_proxy（优先已测速）。
         inner.proxies.sort_by(|a, b| {
             let la = if a.latency <= 0.0 { -1.0 } else { a.latency };
             let lb = if b.latency <= 0.0 { -1.0 } else { b.latency };
@@ -460,8 +462,20 @@ impl ProxyPool {
             return proven.choose(&mut rng).map(|p| p.url.clone());
         }
 
-        let limit = std::cmp::min(15, available.len());
-        available[..limit].choose(&mut rng).map(|p| p.url.clone())
+        // 冷启动盲选：优先在「已测速」（latency > 0，验证时实测过）的节点里挑最快的
+        // 若干个；全池都没有测速数据（例如刚从 proxies.txt 加载）时才退回原始顺序。
+        let measured: Vec<&ProxyEntry> = available
+            .iter()
+            .copied()
+            .filter(|p| p.latency > 0.0)
+            .collect();
+        let cold: &[&ProxyEntry] = if measured.is_empty() {
+            &available
+        } else {
+            &measured
+        };
+        let limit = std::cmp::min(15, cold.len());
+        cold[..limit].choose(&mut rng).map(|p| p.url.clone())
     }
     /// 检查某个 URL 对应的代理当前是否可用（存在于池中且未处于冷却）。
     /// 用于 session → 代理绑定的可用性判定。
@@ -474,6 +488,17 @@ impl ProxyPool {
             .find(|p| p.url == proxy_url)
             .map(|p| p.available(now))
             .unwrap_or(false)
+    }
+
+    /// 该 URL 是否仍在池中（不看冷却状态）。
+    /// 用于 client 缓存清理这类只关心 membership 的判断，与 `is_available` 区分开。
+    pub async fn contains(&self, proxy_url: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .proxies
+            .iter()
+            .any(|p| p.url == proxy_url)
     }
 
     pub async fn report_failure(&self, proxy_url: &str) {

@@ -117,6 +117,13 @@ jobs:
           jq -e '.mode == "authenticated"' settings.json
           jq -e '.api_key == "sk-test"' settings.json
 
+      - name: Metrics count error paths too
+        run: |
+          # 口径统一：上面 502（上游不可达）这类失败请求也要计入 metrics 总请求数，
+          # 与 pool 计数对齐（未通过请求校验的 503/400 两边都不计）。
+          curl -fsS http://127.0.0.1:8910/api/metrics | tee /tmp/metrics.json
+          jq -e '.total_requests >= 1' /tmp/metrics.json
+
       - name: Cleanup
         if: always()
         run: kill $(cat /tmp/gw.pid) 2>/dev/null || true

@@ -1,7 +1,4 @@
-use crate::{
-    settings::{Mode, RuntimeSettings},
-    state::AppState,
-};
+use crate::{settings::Mode, state::AppState};
 use axum::{extract::State, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
@@ -67,10 +64,4 @@ pub async fn api_set_api_key(
         if snapshot.api_key.is_some() { "set" } else { "cleared" }
     );
     Json(json!({ "ok": true, "has_api_key": snapshot.api_key.is_some() }))
-}
-
-// 让 `RuntimeSettings` 在 handler 内部被引用，避免未使用警告
-#[allow(dead_code)]
-fn _ensure_settings_type_in_scope() -> RuntimeSettings {
-    RuntimeSettings::default()
 }
