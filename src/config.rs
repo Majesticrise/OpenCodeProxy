@@ -45,8 +45,11 @@ pub static LOG_BUFFER_CAP: LazyLock<usize> = LazyLock::new(|| {
 pub static ROUTING_FILE: LazyLock<String> =
     LazyLock::new(|| env::var("ROUTING_FILE").unwrap_or_else(|_| "routing.json".to_string()));
 
+/// 运行时设置（匿名/实名模式 + API Key）的持久化文件。
+pub static SETTINGS_FILE: LazyLock<String> =
+    LazyLock::new(|| env::var("SETTINGS_FILE").unwrap_or_else(|_| "settings.json".to_string()));
+
 /// OpenCode CLI 的 User-Agent，版本必须 >= 1.18.0
-/// 默认值来自抓包真实客户端
 pub static OPENCODE_UA: LazyLock<String> = LazyLock::new(|| {
     env::var("OPENCODE_UA").unwrap_or_else(|_| {
         "opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14".to_string()
@@ -67,12 +70,10 @@ pub static INJECT_FREE_TIER_TOOLS: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(true)
 });
 
-/// metrics 聚合总量的持久化文件（只存数字，不存明细）
 pub static METRICS_FILE: LazyLock<String> = LazyLock::new(|| {
     env::var("METRICS_FILE").unwrap_or_else(|_| "metrics_totals.json".to_string())
 });
 
-/// 是否持久化 metrics（默认开）
 pub static PERSIST_METRICS: LazyLock<bool> = LazyLock::new(|| {
     env::var("PERSIST_METRICS")
         .map(|v| v != "false" && v != "0")

@@ -1,14 +1,15 @@
 pub mod forward;
 pub mod models;
 pub mod routing;
+pub mod settings;
 pub mod upstream;
 
 pub use forward::chat_completions;
 pub use models::list_models;
 pub use routing::{api_get_routing, api_set_routing};
+pub use settings::{api_get_settings, api_set_api_key, api_set_mode};
 pub use upstream::{api_upstream_models, api_upstream_refresh};
 
-// 保留原有的非拆分函数
 use axum::{
     extract::State,
     http::{StatusCode, Uri},
@@ -88,6 +89,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
     let upstream = crate::config::ZEN_UPSTREAM.clone();
     let snapshot = state.metrics.snapshot();
+    let settings = state.settings.read().unwrap().clone();
     let (total, available, proven, fetching) = {
         let inner = state.pool.inner.read().await;
         let now = std::time::Instant::now();
@@ -104,6 +106,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     Json(json!({
         "status": "ok",
+        "mode": settings.mode,
+        "has_api_key": settings.api_key.is_some(),
         "proxies": { "total": total, "available": available, "proven": proven, "fetching": fetching },
         "upstream": upstream,
         "metrics": { "success_rate_1h": snapshot.success_rate, "p95_latency_1h": snapshot.p95_latency },

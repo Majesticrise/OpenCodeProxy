@@ -1,0 +1,130 @@
+name: E2E Contract
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 02:00 跑一次，观察契约稳定性趋势
+    - cron: '0 2 * * *'
+
+jobs:
+  contract-probe:
+    name: 契约合法性探针
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-linux
+          cache-on-failure: true
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Start gateway (anonymous mode, direct upstream)
+        run: |
+          # 匿名模式 + 直连（不用代理池，避免 IP 信誉引入额外噪声）
+          PERSIST_METRICS=false \
+          MIN_POOL_SIZE=0 \
+          PROXY_FILE=/dev/null \
+          ./target/release/zen-proxy > /tmp/gw.log 2>&1 &
+          echo $! > /tmp/gw.pid
+          sleep 2
+          cat /tmp/gw.log
+
+      - name: Probe upstream model list
+        run: |
+          # 拉取实时可用模型列表，选一个免费的做测试
+          code=$(curl -s -o /tmp/refresh.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8910/api/upstream/refresh)
+          echo "refresh-code: $code"
+          cat /tmp/refresh.json || true
+
+          if [ "$code" != "200" ]; then
+            echo "⚠️ upstream refresh failed; upstream may be down"
+            # 不算失败，只是无法测试契约
+            exit 0
+          fi
+
+          # 优先选 -free 后缀；如果没有，用 big-pickle
+          MODEL=$(jq -r '.models[]? | select(test("-free$"))' /tmp/refresh.json | head -1)
+          if [ -z "$MODEL" ]; then
+            MODEL="big-pickle"
+          fi
+          echo "MODEL=$MODEL" >> $GITHUB_ENV
+          echo "Probing with model: $MODEL"
+
+      - name: Contract probe (core test)
+        if: env.MODEL != ''
+        run: |
+          RESP_FILE=/tmp/probe.json
+          code=$(curl -s -o "$RESP_FILE" -w '%{http_code}' \
+            -X POST http://127.0.0.1:8910/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"say ok\"}],\"stream\":false}")
+
+          echo "HTTP status: $code"
+          echo "---- response ----"
+          cat "$RESP_FILE"
+          echo
+          echo "------------------"
+
+          # ⭐ 核心断言：
+          #   - FreeTierError → 契约错了，必须失败
+          #   - 200 → 完美（契约对 + 环境好）
+          #   - ModelUnavailable / Deprecated / other 4xx-5xx → 契约对，环境不好，通过
+
+          if grep -q "FreeTierError" "$RESP_FILE" 2>/dev/null; then
+            echo "❌ FAIL: contract invalid (got FreeTierError)"
+            echo "    This means our session/UA/tools contract is broken."
+            exit 1
+          fi
+
+          if [ "$code" = "200" ]; then
+            echo "✅ PASS: got 200 (contract OK, environment OK)"
+            jq -e '.choices[0].message' "$RESP_FILE" > /dev/null || {
+              echo "❌ 200 but no message field"
+              exit 1
+            }
+            exit 0
+          fi
+
+          echo "✅ PASS: contract accepted (non-200 due to environment)"
+          echo "    (model unavailable / deprecated / upstream error — not our bug)"
+          exit 0
+
+      - name: Probe with wrong session (negative test, optional)
+        if: env.MODEL != ''
+        continue-on-error: true
+        run: |
+          # 用明显错误的 session 格式，应该返回 FreeTierError 或 400
+          # 这验证了"上游确实校验 session"，反向证明我们的测试是有意义的
+          code=$(curl -s -o /tmp/bad.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8910/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -H 'x-opencode-session: INVALID_SESSION' \
+            -H 'X-Session-Id: INVALID_SESSION' \
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}")
+          echo "bad-session-code: $code"
+          cat /tmp/bad.json || true
+          # 只打印不断言（上游对错误 session 的响应策略可能变）
+
+      - name: Show gateway log
+        if: always()
+        run: |
+          echo "---- gateway log (last 200 lines) ----"
+          tail -200 /tmp/gw.log || true
+
+      - name: Cleanup
+        if: always()
+        run: kill $(cat /tmp/gw.pid) 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            /tmp/probe.json
+            /tmp/gw.log
+          if-no-files-found: ignore

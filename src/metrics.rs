@@ -514,3 +514,80 @@ impl Drop for MetricsGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_usage_from_sse_chunk() {
+        let chunk = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n";
+        let mut buf = Vec::new();
+        let usage = try_extract_usage_from_chunk(chunk, &mut buf);
+        assert!(usage.is_some(), "should extract usage");
+        let u = usage.unwrap();
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 5);
+        assert_eq!(u.total_tokens, 15);
+    }
+
+    #[test]
+    fn extract_usage_from_bare_json() {
+        // 有些上游返回裸 JSON（非 SSE）
+        let chunk = b"{\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}";
+        let mut buf = Vec::new();
+        let usage = try_extract_usage_from_chunk(chunk, &mut buf);
+        assert!(usage.is_some(), "should extract from bare JSON");
+        assert_eq!(usage.unwrap().total_tokens, 10);
+    }
+
+    #[test]
+    fn extract_usage_with_cached_and_reasoning() {
+        let chunk = br#"data: {"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":10}}}
+"#;
+        let mut buf = Vec::new();
+        let u = try_extract_usage_from_chunk(chunk, &mut buf).unwrap();
+        assert_eq!(u.cached_tokens, 20);
+        assert_eq!(u.reasoning_tokens, 10);
+    }
+
+    #[test]
+    fn extract_usage_no_usage_field() {
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let mut buf = Vec::new();
+        let usage = try_extract_usage_from_chunk(chunk, &mut buf);
+        assert!(usage.is_none(), "no usage field → None");
+    }
+
+    #[test]
+    fn extract_usage_skips_done_marker() {
+        let chunk = b"data: [DONE]\n\n";
+        let mut buf = Vec::new();
+        let usage = try_extract_usage_from_chunk(chunk, &mut buf);
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn usage_info_from_json() {
+        let v = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+            "prompt_tokens_details": {"cached_tokens": 30},
+            "completion_tokens_details": {"reasoning_tokens": 15}
+        });
+        let u = UsageInfo::from_json(&v);
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.cached_tokens, 30);
+        assert_eq!(u.reasoning_tokens, 15);
+    }
+
+    #[test]
+    fn usage_info_from_empty_json() {
+        let u = UsageInfo::from_json(&serde_json::json!({}));
+        assert_eq!(u.total_tokens, 0);
+        assert_eq!(u.cached_tokens, 0);
+    }
+}

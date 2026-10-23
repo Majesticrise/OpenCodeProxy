@@ -115,7 +115,7 @@ body {
 }
 
 .topbar-left { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-dim); }
-.topbar-right { display: flex; gap: 10px; }
+.topbar-right { display: flex; gap: 10px; align-items: center; }
 
 .meta {
     font-size: 11px;
@@ -126,6 +126,20 @@ body {
     border-radius: 4px;
     font-family: ui-monospace, "SF Mono", Consolas, monospace;
 }
+
+.mode-select {
+    background: var(--bg-2);
+    border: 1px solid var(--border-2);
+    color: var(--text);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    cursor: pointer;
+    min-width: 110px;
+}
+.mode-select:focus { border-color: var(--accent); }
 
 .dot {
     width: 8px; height: 8px; border-radius: 50%;
@@ -186,7 +200,6 @@ body {
     .grid-2 { grid-template-columns: 1fr; }
 }
 
-/* ── 指标卡片 ── */
 .metric { padding: 16px 18px; margin-bottom: 0; }
 .metric-label { font-size: 12px; color: var(--text-mute); margin-bottom: 8px; }
 .metric-value {
@@ -197,7 +210,6 @@ body {
 .metric-value small { font-size: 13px; font-weight: 400; color: var(--text-mute); margin-left: 2px; }
 .metric-sub { font-size: 11px; color: var(--text-mute); margin-top: 4px; }
 
-/* ── Hero 数字（Token / 代理池卡片顶部） ── */
 .hero-block {
     padding: 4px 0 16px;
     border-bottom: 1px dashed var(--border);
@@ -221,7 +233,6 @@ body {
     text-transform: uppercase;
 }
 
-/* ── Token 进度条列表 ── */
 .token-list { display: flex; flex-direction: column; gap: 12px; }
 
 .token-row-head {
@@ -271,7 +282,6 @@ body {
 .progress-fill.fill-purple { background: linear-gradient(90deg, #c4b5fd, var(--purple)); }
 .progress-fill.fill-blue { background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
 
-/* ── 图表容器：缩小高度，避免占屏 ── */
 .chart-card { padding-bottom: 12px; }
 .chart-card .card-title { margin-bottom: 10px; }
 #chartPerMinute {
@@ -280,7 +290,6 @@ body {
     display: block;
 }
 
-/* ── 键值对 ── */
 .kv {
     display: flex;
     justify-content: space-between;
@@ -300,7 +309,6 @@ body {
     color: var(--accent-2);
 }
 
-/* ── 条形图列表（模型 / HTTP 状态） ── */
 .list { display: flex; flex-direction: column; gap: 8px; }
 .bar-row {
     display: grid;
@@ -344,7 +352,6 @@ body {
     padding: 20px 0;
 }
 
-/* ── 按钮 ── */
 .btn {
     display: inline-flex;
     align-items: center;
@@ -373,7 +380,6 @@ body {
 .btn-ghost:hover:not(:disabled) { background: var(--bg-2); color: var(--text); }
 #toggleBtn { width: 100%; }
 
-/* ── 日志视图 ── */
 #view-logs { display: none; height: 100%; }
 #view-logs.active { display: flex; flex-direction: column; height: 100%; }
 
@@ -455,7 +461,6 @@ body {
 .log-line.dim .log-level,
 .log-line.dim .log-msg { color: var(--log-dim); }
 
-/* ── Playground ── */
 .pg-row {
     display: flex; align-items: center; gap: 14px;
     margin-bottom: 14px; flex-wrap: wrap;
@@ -528,7 +533,6 @@ select:focus { border-color: var(--accent); }
 
 .muted { color: var(--text-mute); font-size: 12px; }
 
-/* ── 路由规则表格 ── */
 .model-chips {
     display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;
 }
@@ -545,6 +549,8 @@ select:focus { border-color: var(--accent); }
     transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
 .model-chip:hover { background: var(--bg-3); color: var(--text); }
+.model-chip.paid { opacity: 0.45; cursor: not-allowed; }
+.model-chip.paid:hover { background: var(--bg-2); color: var(--text-dim); }
 
 .table-wrap {
     overflow-x: auto;
@@ -605,7 +611,6 @@ select:focus { border-color: var(--accent); }
     margin-left: 4px;
 }
 
-/* ── Toast ── */
 .toast {
     position: fixed;
     bottom: 24px;
@@ -627,11 +632,7 @@ select:focus { border-color: var(--accent); }
 .toast.ok { border-color: var(--green); }
 .toast.err { border-color: var(--red); }
 
-/* ── 滚动条 ── */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
-
-.model-chip.paid { opacity: 0.45; cursor: not-allowed; }
-.model-chip.paid:hover { background: var(--bg-2); color: var(--text-dim); }

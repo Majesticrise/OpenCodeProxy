@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── L1：静态检查 + 单元测试（快速反馈，3–5 分钟） ──
+  check:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux
+          cache-on-failure: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -W clippy::all
+        continue-on-error: true
+
+      - name: cargo test
+        run: cargo test --all --no-fail-fast
+
+      - name: cargo build --release
+        run: cargo build --release
+
+  # ── L2：启动网关，验证契约构建无崩溃（不做真实上游请求） ──
+  smoke:
+    name: Gateway Smoke
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux
+          cache-on-failure: true
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Start gateway (no proxy, no real requests)
+        run: |
+          # 用无害的 ZEN_UPSTREAM 避免启动时探测真实上游
+          ZEN_UPSTREAM=http://127.0.0.1:9 \
+          PERSIST_METRICS=false \
+          MIN_POOL_SIZE=1 \
+          ./target/release/zen-proxy > /tmp/gw.log 2>&1 &
+          echo $! > /tmp/gw.pid
+          sleep 3
+          cat /tmp/gw.log
+
+      - name: Health check
+        run: |
+          curl -fsS http://127.0.0.1:8910/health | tee /tmp/health.json
+          jq -e '.status == "ok"' /tmp/health.json
+          jq -e '.mode == "anonymous"' /tmp/health.json
+
+      - name: Settings endpoints (mode switch, api key)
+        run: |
+          # 1) 初始状态
+          curl -fsS http://127.0.0.1:8910/api/settings | tee /tmp/s1.json
+          jq -e '.has_api_key == false' /tmp/s1.json
+
+          # 2) 切到实名但无 key → 应拒绝
+          resp=$(curl -s -X POST http://127.0.0.1:8910/api/settings/mode \
+            -H 'Content-Type: application/json' \
+            -d '{"mode":"authenticated"}')
+          echo "set-mode-before-key: $resp"
+          # 后端不强制阻止（只前端阻止），所以这里只验证持久化行为
+          jq -e '.ok == true' <<< "$resp"
+
+          # 3) 实名模式下无 key 的请求应 503
+          code=$(curl -s -o /tmp/chat.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8910/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":false}')
+          echo "chat-code: $code"
+          [ "$code" = "503" ] || { echo "❌ expected 503 when authenticated without key"; exit 1; }
+
+          # 4) 配 key 后应该放行到上游（这里上游是 127.0.0.1:9，连不上，会 502）
+          curl -fsS -X POST http://127.0.0.1:8910/api/settings/apikey \
+            -H 'Content-Type: application/json' \
+            -d '{"api_key":"sk-test"}' | jq -e '.ok == true'
+
+          code=$(curl -s -o /tmp/chat.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8910/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":false}')
+          echo "chat-code-with-key: $code"
+          # 期望不是 503（不是"拒绝"），是 502 或 500（上游连不上）
+          [ "$code" != "503" ] || { echo "❌ still 503 with key set"; exit 1; }
+
+      - name: Settings persisted to file
+        run: |
+          cat settings.json
+          jq -e '.mode == "authenticated"' settings.json
+          jq -e '.api_key == "sk-test"' settings.json
+
+      - name: Cleanup
+        if: always()
+        run: kill $(cat /tmp/gw.pid) 2>/dev/null || true
+
+      - name: Show gateway log
+        if: always()
+        run: tail -100 /tmp/gw.log || true

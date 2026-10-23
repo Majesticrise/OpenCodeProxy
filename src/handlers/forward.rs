@@ -1,4 +1,4 @@
-use crate::{config::*, opencode_identity, state::AppState};
+use crate::{config::*, opencode_identity, settings::Mode, state::AppState};
 use axum::{
     body::Body,
     extract::State,
@@ -109,10 +109,6 @@ fn update_session_binding(
     bindings.insert(session_id.to_string(), proxy);
 }
 
-/// 聚合上游 SSE 为非流式 JSON。
-///
-/// 累加 `content`、`reasoning_content`、`tool_calls`（按 index 合并），
-/// 保证非流式下游与流式下游拿到等价信息。
 async fn aggregate_sse_to_json(
     resp: wreq::Response,
 ) -> Result<(Vec<u8>, Option<crate::metrics::UsageInfo>), String> {
@@ -130,7 +126,6 @@ async fn aggregate_sse_to_json(
         match stream.next().await {
             Some(Ok(chunk)) => {
                 buf.extend_from_slice(&chunk);
-
                 let mut start = 0;
                 while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
                     let end = start + pos;
@@ -161,7 +156,6 @@ async fn aggregate_sse_to_json(
                                 usage = Some(crate::metrics::UsageInfo::from_json(u));
                             }
                         }
-
                         if let Some(delta) = v
                             .get("choices")
                             .and_then(|c| c.as_array())
@@ -171,21 +165,13 @@ async fn aggregate_sse_to_json(
                             if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
                                 content.push_str(c);
                             }
-                            if let Some(rc) = delta
-                                .get("reasoning_content")
-                                .and_then(|r| r.as_str())
-                            {
+                            if let Some(rc) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
                                 reasoning_content.push_str(rc);
                             }
-                            if let Some(tc_arr) =
-                                delta.get("tool_calls").and_then(|t| t.as_array())
-                            {
+                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                 for tc in tc_arr {
-                                    let idx = tc
-                                        .get("index")
-                                        .and_then(|i| i.as_u64())
-                                        .unwrap_or(0)
-                                        as usize;
+                                    let idx =
+                                        tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                                     while tool_calls.len() <= idx {
                                         tool_calls.push(json!({
                                             "id": "",
@@ -193,9 +179,7 @@ async fn aggregate_sse_to_json(
                                             "function": { "name": "", "arguments": "" }
                                         }));
                                     }
-                                    if let Some(cid) =
-                                        tc.get("id").and_then(|i| i.as_str())
-                                    {
+                                    if let Some(cid) = tc.get("id").and_then(|i| i.as_str()) {
                                         if !cid.is_empty() {
                                             tool_calls[idx]["id"] = json!(cid);
                                         }
@@ -206,8 +190,7 @@ async fn aggregate_sse_to_json(
                                         .and_then(|n| n.as_str())
                                     {
                                         if !name.is_empty() {
-                                            tool_calls[idx]["function"]["name"] =
-                                                json!(name);
+                                            tool_calls[idx]["function"]["name"] = json!(name);
                                         }
                                     }
                                     if let Some(args) = tc
@@ -215,10 +198,8 @@ async fn aggregate_sse_to_json(
                                         .and_then(|f| f.get("arguments"))
                                         .and_then(|a| a.as_str())
                                     {
-                                        let prev = tool_calls[idx]["function"]
-                                            ["arguments"]
-                                            .as_str()
-                                            .unwrap_or("");
+                                        let prev =
+                                            tool_calls[idx]["function"]["arguments"].as_str().unwrap_or("");
                                         tool_calls[idx]["function"]["arguments"] =
                                             json!(format!("{}{}", prev, args));
                                     }
@@ -249,17 +230,9 @@ async fn aggregate_sse_to_json(
         .unwrap_or_default()
         .as_secs();
 
-    // 有 tool_calls → "tool_calls"；否则一律 "stop"（不误报 token 上限）。
-    let finish_reason = if !tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
+    let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
 
-    let mut message = json!({
-        "role": "assistant",
-        "content": content,
-    });
+    let mut message = json!({ "role": "assistant", "content": content });
     if !reasoning_content.is_empty() {
         message["reasoning_content"] = json!(reasoning_content);
     }
@@ -283,8 +256,7 @@ async fn aggregate_sse_to_json(
         response_json["x_upstream_broken"] = json!(true);
     }
 
-    let bytes =
-        serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
+    let bytes = serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
     Ok((bytes, usage))
 }
 
@@ -312,6 +284,19 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // ⭐ 读取运行时设置：模式 + API Key
+    let settings_snapshot = state.settings.read().unwrap().clone();
+    let is_authenticated = matches!(settings_snapshot.mode, Mode::Authenticated);
+
+    // 实名模式必须配置 API Key，否则直接拒绝
+    if is_authenticated && settings_snapshot.api_key.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authenticated mode requires an API key. Configure it in WebUI first.",
+        )
+            .into_response();
+    }
+
     let body_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(j) => j,
         Err(e) => {
@@ -329,7 +314,7 @@ pub async fn chat_completions(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // ⭐ 恢复旧版：session 优先客户端头，否则用时间戳 + counter 生成
+    // session：客户端头优先，否则时间戳生成
     let mut session_id = headers
         .get("x-opencode-session")
         .or_else(|| headers.get("X-Session-Id"))
@@ -338,7 +323,10 @@ pub async fn chat_completions(
         .map(String::from)
         .unwrap_or_else(opencode_identity::generate_session_id);
 
-    let bound: Option<Option<String>> = {
+    // 实名模式：不查绑定，强制直连
+    let bound: Option<Option<String>> = if is_authenticated {
+        None
+    } else {
         let bindings = state.session_proxy_binding.read().unwrap();
         bindings.get(&session_id).cloned()
     };
@@ -354,15 +342,21 @@ pub async fn chat_completions(
         _ => None,
     };
 
-    let skip_proxy_loop = matches!(bound, Some(None));
+    // 实名模式强制跳过代理循环
+    let skip_proxy_loop = if is_authenticated {
+        true
+    } else {
+        matches!(bound, Some(None))
+    };
 
     let routing_snapshot = state.routing.read().unwrap().clone();
     let candidates = resolve_candidates(&routing_snapshot, &requested_model);
     let enable_fallback = routing_snapshot.enable_fallback_chain;
 
     info!(
-        "→ {} model={} session={} bind={} (downstream_stream={})",
+        "→ {} mode={:?} model={} session={} bind={} (downstream_stream={})",
         if downstream_stream { "STREAM" } else { "SYNC  " },
+        settings_snapshot.mode,
         requested_model,
         &session_id[..session_id.len().min(12)],
         match &bound {
@@ -404,6 +398,7 @@ pub async fn chat_completions(
     let mut first_upstream_error: Option<(u16, bytes::Bytes)> = None;
     let mut freetier_403_count = 0u32;
 
+    // 实名模式 skip_proxy_loop = true，循环直接 break，走下方直连分支
     for attempt in 0..max_retries {
         if skip_proxy_loop {
             break;
@@ -513,7 +508,6 @@ pub async fn chat_completions(
                     if let Some(ref p) = proxy {
                         state.pool.report_banned(p).await;
                     }
-                    // 连续 2 次 403 → 清绑定 + 换一个全新的时间戳 session
                     if freetier_403_count >= 2 {
                         {
                             let mut bindings = state.session_proxy_binding.write().unwrap();
@@ -533,8 +527,7 @@ pub async fn chat_completions(
 
                 let is_model_unavailable = body_str.contains("Model is unavailable");
 
-                if is_model_unavailable && enable_fallback && candidate_idx + 1 < candidates.len()
-                {
+                if is_model_unavailable && enable_fallback && candidate_idx + 1 < candidates.len() {
                     warn!(
                         "Model {} unavailable, falling back to {}",
                         current_upstream,
@@ -605,7 +598,11 @@ pub async fn chat_completions(
     let resp = match target_resp {
         Some(r) => r,
         None => {
-            warn!("All proxies failed. Falling back to direct connection.");
+            if is_authenticated {
+                info!("Authenticated mode: direct connection with API key");
+            } else {
+                warn!("All proxies failed. Falling back to direct connection.");
+            }
             last_proxy = None;
             let client = match get_or_build_client(&state, &None).await {
                 Ok(c) => c,
@@ -618,7 +615,8 @@ pub async fn chat_completions(
                 }
             };
             let target_url = format!("{}/chat/completions", *ZEN_UPSTREAM);
-            let (builder, _, _) = if *INJECT_FREE_TIER_HEADERS {
+
+            let (mut builder, _, _) = if *INJECT_FREE_TIER_HEADERS {
                 opencode_identity::apply_headers(client.post(&target_url), &session_id)
             } else {
                 (
@@ -629,17 +627,26 @@ pub async fn chat_completions(
                     String::new(),
                 )
             };
+
+            // 实名模式：额外加 Authorization
+            if is_authenticated {
+                if let Some(key) = &settings_snapshot.api_key {
+                    builder = builder.header("Authorization", format!("Bearer {}", key));
+                }
+            }
+
             let builder = builder.header("Accept", "text/event-stream");
             match builder.json(&forward_body).send().await {
                 Ok(r) => {
-                    {
+                    // 只有匿名模式写回绑定；实名模式总是直连，不写绑定
+                    if !is_authenticated {
                         let mut bindings = state.session_proxy_binding.write().unwrap();
                         update_session_binding(&mut bindings, &session_id, None);
                     }
                     r
                 }
                 Err(e) => {
-                    {
+                    if !is_authenticated {
                         let mut bindings = state.session_proxy_binding.write().unwrap();
                         bindings.remove(&session_id);
                     }

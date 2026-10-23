@@ -5,6 +5,7 @@ mod metrics;
 mod middleware;
 mod opencode_identity;
 mod proxy;
+mod settings;
 mod state;
 use dashmap::DashMap;
 
@@ -13,6 +14,7 @@ use crate::{
     logger::{LogBuffer, LogLayer},
     metrics::MetricsStore,
     proxy::ProxyPool,
+    settings::RuntimeSettings,
     state::AppState,
 };
 use axum::{
@@ -35,7 +37,6 @@ async fn main() {
     let log_buffer = Arc::new(LogBuffer::new());
     let filter = env::var("RUST_LOG").unwrap_or_else(|_| config::LOG_LEVEL.to_string());
 
-    // 终端输出走 fmt::layer，Web 缓冲走自定义 LogLayer
     let subscriber = tracing_subscriber::registry()
         .with(EnvFilter::new(filter))
         .with(
@@ -83,7 +84,10 @@ async fn main() {
         );
     }
 
-    // ── Metrics（累计数字持久化到磁盘） ──
+    // ── 运行时设置（匿名/实名模式 + API Key） ──
+    let settings = Arc::new(RwLock::new(RuntimeSettings::load()));
+
+    // ── Metrics ──
     let metrics_path = if *config::PERSIST_METRICS {
         Some(std::path::PathBuf::from(&*config::METRICS_FILE))
     } else {
@@ -99,7 +103,7 @@ async fn main() {
         }
     });
 
-    // ── 组装 AppState ──
+    // ── AppState ──
     let state = AppState {
         pool: proxy_pool,
         log_buffer: log_buffer.clone(),
@@ -108,6 +112,7 @@ async fn main() {
         routing: Arc::new(RwLock::new(routing)),
         upstream_models: Arc::new(RwLock::new(Default::default())),
         session_proxy_binding: Arc::new(RwLock::new(HashMap::new())),
+        settings,
     };
 
     let app = Router::new()
@@ -124,6 +129,11 @@ async fn main() {
         )
         .route("/api/upstream/models", get(handlers::api_upstream_models))
         .route("/api/upstream/refresh", post(handlers::api_upstream_refresh))
+        // 运行时设置
+        .route("/api/settings", get(handlers::api_get_settings))
+        .route("/api/settings/mode", post(handlers::api_set_mode))
+        .route("/api/settings/apikey", post(handlers::api_set_api_key))
+        // OpenAI 兼容端点
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .layer(axum_middleware::from_fn(middleware::strip_auth_middleware))

@@ -3,6 +3,7 @@ use crate::{
     logger::LogBuffer,
     metrics::MetricsStore,
     proxy::ProxyPool,
+    settings::RuntimeSettings,
 };
 use dashmap::DashMap;
 use std::{
@@ -32,4 +33,6 @@ pub struct AppState {
     /// - `Some(None)`：该 session 上次走直连成功
     /// - 未插入：未绑定，走随机选代理
     pub session_proxy_binding: Arc<RwLock<HashMap<String, Option<String>>>>,
+    /// 运行时设置（匿名/实名模式 + API Key）
+    pub settings: Arc<RwLock<RuntimeSettings>>,
 }

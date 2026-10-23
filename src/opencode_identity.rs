@@ -226,3 +226,182 @@ pub fn apply_headers(
         .header("X-Session-Id", session_id);
     (builder, session_id.to_string(), request_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    fn session_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$").unwrap())
+    }
+
+    fn request_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$").unwrap())
+    }
+
+    /// session ID 必须严格匹配 OpenCode CLI 的格式：
+    /// ses_ + 12位小写hex + 14位Base62，总长 30
+    #[test]
+    fn session_id_matches_format() {
+        for i in 0..200 {
+            let id = generate_session_id();
+            assert_eq!(id.len(), 30, "iteration {}: length is {}, id={}", i, id.len(), id);
+            assert!(
+                session_re().is_match(&id),
+                "iteration {}: format mismatch, id={}",
+                i,
+                id
+            );
+        }
+    }
+
+    /// ⭐ 关键陷阱：counter 必须用 `& 0x3F`（0–63）限制。
+    /// 如果误用 `& 0xFFF`（0–4095），生成的 hex 反解后 counter > 63，
+    /// 上游解码失败 → 403 FreeTierError。
+    #[test]
+    fn session_id_counter_in_valid_range() {
+        for _ in 0..200 {
+            let id = generate_session_id();
+            let hex_part = &id[4..16];
+            let raw = u64::from_str_radix(hex_part, 16).expect("hex decode");
+            // 上游解码逻辑：hex 是 ~raw 的字符串表示
+            let inverted_back = !raw & 0xFFFF_FFFF_FFFF;
+            let counter = inverted_back & 0xFFF; // 取低 12 位，不能只看 6 位
+            assert!(
+                counter <= 63,
+                "counter={} out of range (must be 0–63); raw structure is invalid",
+                counter
+            );
+        }
+    }
+
+    /// session ID 不能重复（至少短时间内不重复）
+    #[test]
+    fn session_id_uniqueness() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..500 {
+            let id = generate_session_id();
+            assert!(seen.insert(id.clone()), "duplicate session id: {}", id);
+        }
+    }
+
+    /// request ID 必须严格匹配 msg_ 格式
+    #[test]
+    fn request_id_matches_format() {
+        for i in 0..200 {
+            let id = generate_request_id();
+            assert_eq!(id.len(), 30, "iteration {}: length is {}", i, id.len());
+            assert!(request_re().is_match(&id), "iteration {}: format mismatch, id={}", i, id);
+        }
+    }
+
+    /// 空 body 注入后应得到 6 个官方工具 + tool_choice=auto
+    #[test]
+    fn inject_tools_into_empty_body() {
+        let mut body = serde_json::json!({});
+        inject_free_tier_tools(&mut body);
+
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 6, "expected 6 official tools");
+
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["bash", "edit", "glob", "grep", "read", "write"],
+            "official tools must be in OFFICIAL_TOOLS order"
+        );
+
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    /// read / bash 的 parameters.properties 必须非空，
+    /// 空 schema 会触发上游 403。
+    #[test]
+    fn inject_tools_fixes_empty_schema() {
+        let mut body = serde_json::json!({
+            "tools": [
+                {"type": "function", "function": {"name": "read", "parameters": {}}},
+                {"type": "function", "function": {"name": "bash", "parameters": {}}}
+            ]
+        });
+        inject_free_tier_tools(&mut body);
+
+        let tools = body["tools"].as_array().unwrap();
+        let read = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "read")
+            .expect("read should exist");
+        let bash = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "bash")
+            .expect("bash should exist");
+
+        assert!(
+            !read["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap_or(&serde_json::Map::new())
+                .is_empty(),
+            "read.parameters.properties must be non-empty"
+        );
+        assert!(
+            !bash["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap_or(&serde_json::Map::new())
+                .is_empty(),
+            "bash.parameters.properties must be non-empty"
+        );
+    }
+
+    /// 客户端自定义工具不能被丢弃；顺序是 [官方 6 个..., 自定义...]
+    #[test]
+    fn inject_tools_preserves_custom() {
+        let mut body = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "my_custom",
+                    "description": "custom",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"x": {"type": "string"}}
+                    }
+                }
+            }]
+        });
+        inject_free_tier_tools(&mut body);
+
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 7, "6 official + 1 custom");
+
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        // 官方在前
+        assert_eq!(&names[0..6], &["bash", "edit", "glob", "grep", "read", "write"]);
+        // 自定义在后
+        assert_eq!(names[6], "my_custom");
+    }
+
+    /// 重复注入应该幂等（不会重复添加工具）
+    #[test]
+    fn inject_tools_idempotent() {
+        let mut body = serde_json::json!({});
+        inject_free_tier_tools(&mut body);
+        let count_first = body["tools"].as_array().unwrap().len();
+
+        inject_free_tier_tools(&mut body);
+        let count_second = body["tools"].as_array().unwrap().len();
+
+        assert_eq!(count_first, count_second, "double injection should be idempotent");
+        assert_eq!(count_first, 6);
+    }
+}

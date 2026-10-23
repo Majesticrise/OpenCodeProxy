@@ -38,8 +38,6 @@ function toast(msg, kind = '') {
 }
 
 // ── 免费模型判定 ──
-// 上游 /v1/models 不返回价格字段，只能靠后缀 + 白名单判断。
-// `big-pickle` 没有 -free 后缀，但输入输出及缓存价格均为零。
 const FREE_WHITELIST = new Set(['big-pickle']);
 
 function isFreeModel(id) {
@@ -63,6 +61,10 @@ const state = {
     upstreamModels: [],
     routeRows: [],
     enableFallback: true,
+    // 运行时设置
+    mode: 'anonymous',
+    hasApiKey: false,
+    apiKeyMasked: null,
 };
 
 // ── 视图切换 ──
@@ -78,8 +80,112 @@ function switchView(name) {
         loadRouting();
         loadUpstreamModels();
     } else if (name === 'playground') {
-        // 每次进入 Playground 时刷新免费模型列表，跟上上游轮换
         loadModels();
+    } else if (name === 'apikey') {
+        fetchSettings();
+    }
+}
+
+// ── 运行时设置 ──
+async function fetchSettings() {
+    try {
+        const r = await fetch('/api/settings');
+        const d = await r.json();
+        state.mode = d.mode;
+        state.hasApiKey = d.has_api_key;
+        state.apiKeyMasked = d.api_key_masked;
+        renderSettings();
+    } catch (_) {}
+}
+
+function renderSettings() {
+    const sel = $('#modeSelect');
+    if (sel) sel.value = state.mode;
+
+    const statusEl = $('#apiKeyStatus');
+    if (statusEl) {
+        statusEl.textContent = state.hasApiKey
+            ? (state.apiKeyMasked || '已配置')
+            : '未配置';
+    }
+    const modeEl = $('#apiKeyMode');
+    if (modeEl) {
+        modeEl.textContent = state.mode === 'authenticated' ? '实名模式（直连 + Key）' : '匿名模式（代理池 + 伪装）';
+    }
+}
+
+async function onModeChange(e) {
+    const mode = e.target.value;
+    if (mode === 'authenticated' && !state.hasApiKey) {
+        toast('实名模式需要先配置 API Key', 'err');
+        e.target.value = state.mode;
+        return;
+    }
+    try {
+        const r = await fetch('/api/settings/mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+            state.mode = d.mode;
+            toast(`已切换到${mode === 'anonymous' ? '匿名' : '实名'}模式`, 'ok');
+            renderSettings();
+            await fetchStatus();
+        } else {
+            toast('切换失败: ' + (d.error || '未知错误'), 'err');
+            e.target.value = state.mode;
+        }
+    } catch (err) {
+        toast('网络错误: ' + err.message, 'err');
+        e.target.value = state.mode;
+    }
+}
+
+async function saveApiKey() {
+    const input = $('#apiKeyInput');
+    const key = input.value.trim();
+    if (!key) {
+        toast('请输入 API Key', 'err');
+        return;
+    }
+    try {
+        const r = await fetch('/api/settings/apikey', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: key }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+            toast('API Key 已保存', 'ok');
+            input.value = '';
+            await fetchSettings();
+        } else {
+            toast('保存失败: ' + (d.error || '未知错误'), 'err');
+        }
+    } catch (err) {
+        toast('网络错误: ' + err.message, 'err');
+    }
+}
+
+async function clearApiKey() {
+    if (!confirm('确定清除 API Key？实名模式下将无法使用。')) return;
+    try {
+        const r = await fetch('/api/settings/apikey', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: null }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+            toast('API Key 已清除', 'ok');
+            await fetchSettings();
+        } else {
+            toast('清除失败', 'err');
+        }
+    } catch (err) {
+        toast('网络错误: ' + err.message, 'err');
     }
 }
 
@@ -142,7 +248,6 @@ function renderMetrics() {
     const m = state.metrics;
     if (!m) return;
 
-    // 主指标
     $('#m-total').textContent = fmtExact(m.total_requests || 0);
     $('#m-total').title = `精确值: ${fmtExact(m.total_requests || 0)} 次`;
     $('#m-success').textContent = (m.success_rate || 0).toFixed(1) + '%';
@@ -150,7 +255,6 @@ function renderMetrics() {
     $('#m-active').textContent = fmtExact(m.active_requests || 0);
     $('#m-active-streams').textContent = '流式 ' + fmtExact(m.active_streams || 0);
 
-    // Token
     const total = m.total_tokens || 0;
     const cached = m.cached_tokens || 0;
     const reasoning = m.reasoning_tokens || 0;
@@ -160,19 +264,16 @@ function renderMetrics() {
     $('#t-total').title = `精确值: ${fmtExact(total)} tokens` +
         (total >= 1000 ? ` (${fmtNum(total)})` : '');
 
-    // 缓存命中
     const cachedPct = total > 0 ? Math.min((cached / total) * 100, 100) : 0;
     $('#t-cached').textContent = fmtExact(cached);
     $('#t-cached').title = `精确值: ${fmtExact(cached)} tokens · 占比 ${cachedPct.toFixed(1)}%`;
     $('#t-cached-bar').style.width = cachedPct.toFixed(1) + '%';
 
-    // 推理
     const reasoningPct = total > 0 ? Math.min((reasoning / total) * 100, 100) : 0;
     $('#t-reasoning').textContent = fmtExact(reasoning);
     $('#t-reasoning').title = `精确值: ${fmtExact(reasoning)} tokens · 占比 ${reasoningPct.toFixed(1)}%`;
     $('#t-reasoning-bar').style.width = reasoningPct.toFixed(1) + '%';
 
-    // 覆盖率
     $('#t-coverage').textContent = coverage.toFixed(1) + '%';
     $('#t-coverage-bar').style.width = Math.min(coverage, 100).toFixed(1) + '%';
 
@@ -251,7 +352,6 @@ function drawChart() {
         ctx.moveTo(padL, y);
         ctx.lineTo(padL + cw, y);
         ctx.stroke();
-        // Y 轴保持缩写，避免撑开左侧空间
         ctx.fillText(fmtNum(Math.round(maxVal * (1 - i / 4))), padL - 6, y);
     }
     const slotW = cw / data.length;
@@ -271,7 +371,6 @@ function drawChart() {
 
 // ── 日志 ──
 function parseLogLine(line) {
-    // 新格式：[2026-10-18 06:30:15.678] [ INFO] message
     const m = line.match(/^\[([\d\- :\.]+)\]\s+\[\s*(\w+)\]\s+([\s\S]*)$/);
     if (m) return { ts: m[1].trim(), level: m[2].toUpperCase(), msg: m[3] };
     return { ts: '', level: 'INFO', msg: line };
@@ -487,15 +586,9 @@ async function saveRouting() {
 }
 
 // ── Playground ──
-// 模型来源优先级：
-//   1. /api/upstream/models（实时目录，自动跟随上游轮换）
-//   2. /v1/models（routing 映射或后端兜底列表）
-//   3. 硬编码兜底（前两个都失败时）
-// 无论哪条路径，最终都按 isFreeModel() 过滤，只保留免费模型。
 async function loadModels() {
     let allModels = [];
 
-    // 1) 实时上游目录
     try {
         const r = await fetch('/api/upstream/models');
         const d = await r.json();
@@ -504,7 +597,6 @@ async function loadModels() {
         }
     } catch (_) {}
 
-    // 2) 回退到 /v1/models（routing 映射或后端硬编码）
     if (allModels.length === 0) {
         try {
             const r = await fetch('/v1/models');
@@ -513,12 +605,10 @@ async function loadModels() {
         } catch (_) {}
     }
 
-    // 3) 最终兜底
     if (allModels.length === 0) {
         allModels = ['big-pickle', 'mimo-v2.6-flash-free'];
     }
 
-    // 过滤免费模型，去重，保持顺序
     const seen = new Set();
     const freeModels = [];
     for (const id of allModels) {
@@ -528,7 +618,6 @@ async function loadModels() {
         freeModels.push(id);
     }
 
-    // 兜底列表如果也被过滤空了（极端情况），至少给一个
     if (freeModels.length === 0) {
         freeModels.push('big-pickle');
     }
@@ -622,6 +711,25 @@ function bindEvents() {
         el.addEventListener('click', () => switchView(el.dataset.view)));
     $('#toggleBtn').addEventListener('click', toggleService);
 
+    // 模式切换
+    const modeSel = $('#modeSelect');
+    if (modeSel) modeSel.addEventListener('change', onModeChange);
+
+    // API Key 管理
+    const btnSaveKey = $('#btnSaveKey');
+    if (btnSaveKey) btnSaveKey.addEventListener('click', saveApiKey);
+    const btnClearKey = $('#btnClearKey');
+    if (btnClearKey) btnClearKey.addEventListener('click', clearApiKey);
+    const apiKeyInput = $('#apiKeyInput');
+    if (apiKeyInput) {
+        apiKeyInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                saveApiKey();
+            }
+        });
+    }
+
     $$('#levelFilter .chip').forEach((chip) =>
         chip.addEventListener('click', () => {
             $$('#levelFilter .chip').forEach((c) => c.classList.remove('active'));
@@ -671,6 +779,7 @@ function bindEvents() {
             fetchStatus();
             fetchMetrics();
             fetchLogs();
+            fetchSettings();
             startPolling();
         } else {
             stopPolling();
@@ -692,7 +801,13 @@ function stopPolling() {
 
 async function init() {
     bindEvents();
-    await Promise.all([fetchStatus(), fetchMetrics(), fetchLogs(), loadModels()]);
+    await Promise.all([
+        fetchStatus(),
+        fetchMetrics(),
+        fetchLogs(),
+        fetchSettings(),
+        loadModels(),
+    ]);
     startPolling();
 }
 

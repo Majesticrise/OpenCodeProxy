@@ -22,6 +22,7 @@
                 <a class="nav-item" data-view="routing"><span>🧭</span>模型路由</a>
                 <a class="nav-item" data-view="logs"><span>📋</span>实时日志</a>
                 <a class="nav-item" data-view="playground"><span>🧪</span>Playground</a>
+                <a class="nav-item" data-view="apikey"><span>🔑</span>API Key</a>
                 <a class="nav-item" data-view="config"><span>⚙️</span>配置</a>
             </nav>
 
@@ -37,6 +38,10 @@
                     <span id="statusLabel">连接中…</span>
                 </div>
                 <div class="topbar-right">
+                    <select id="modeSelect" class="mode-select" title="切换匿名/实名模式">
+                        <option value="anonymous">匿名模式</option>
+                        <option value="authenticated">实名模式</option>
+                    </select>
                     <span class="meta" id="metaPort">:8910</span>
                     <span class="meta" id="metaUpstream">opencode.ai/zen/v1</span>
                 </div>
@@ -66,7 +71,6 @@
                     </div>
 
                     <div class="grid grid-2">
-                        <!-- ⭐ Token 使用：大数字 + 三条占比条 -->
                         <div class="card token-card">
                             <div class="card-title">Token 使用</div>
                             <div class="hero-block">
@@ -110,7 +114,6 @@
                             </div>
                         </div>
 
-                        <!-- ⭐ 代理池：大数字 + 键值 -->
                         <div class="card pool-card">
                             <div class="card-title">代理池</div>
                             <div class="hero-block">
@@ -169,9 +172,7 @@
                                         <th style="width: 60px">操作</th>
                                     </tr>
                                 </thead>
-                                <tbody id="routeTableBody">
-                                    <!-- 动态填充 -->
-                                </tbody>
+                                <tbody id="routeTableBody"></tbody>
                             </table>
                         </div>
                         <div class="pg-row" style="margin-top: 12px">
@@ -219,6 +220,31 @@
                     <div class="card">
                         <div class="card-title">响应</div>
                         <pre class="response" id="pgResponse"></pre>
+                    </div>
+                </section>
+
+                <!-- API Key 管理 -->
+                <section class="view" id="view-apikey">
+                    <div class="card">
+                        <div class="card-title">API Key 管理</div>
+                        <p class="muted">
+                            实名模式需要配置 API Key。Key 明文存储在本地 <code>settings.json</code>，
+                            仅限本机使用；切换模式后立即生效，无需重启。
+                        </p>
+                        <div class="pg-row">
+                            <input type="password" id="apiKeyInput" class="search"
+                                   placeholder="sk-..." autocomplete="off" />
+                            <button class="btn btn-primary" id="btnSaveKey">保存</button>
+                            <button class="btn btn-ghost" id="btnClearKey">清除</button>
+                        </div>
+                        <div class="kv">
+                            <span>当前状态</span>
+                            <span id="apiKeyStatus">未配置</span>
+                        </div>
+                        <div class="kv">
+                            <span>当前模式</span>
+                            <span id="apiKeyMode">-</span>
+                        </div>
                     </div>
                 </section>
 
