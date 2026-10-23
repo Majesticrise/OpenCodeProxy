@@ -115,7 +115,7 @@ body {
 }
 
 .topbar-left { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-dim); }
-.topbar-right { display: flex; gap: 10px; align-items: center; }
+.topbar-right { display: flex; gap: 12px; align-items: center; }
 
 .meta {
     font-size: 11px;
@@ -127,19 +127,87 @@ body {
     font-family: ui-monospace, "SF Mono", Consolas, monospace;
 }
 
-.mode-select {
+/* ── 匿名/实名滑动开关 ── */
+.mode-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 10px 3px 8px;
     background: var(--bg-2);
     border: 1px solid var(--border-2);
-    color: var(--text);
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-family: inherit;
-    outline: none;
-    cursor: pointer;
-    min-width: 110px;
+    border-radius: 20px;
+    user-select: none;
 }
-.mode-select:focus { border-color: var(--accent); }
+
+.mode-label {
+    font-size: 11px;
+    color: var(--text-mute);
+    transition: color 0.2s, font-weight 0.2s;
+    white-space: nowrap;
+    cursor: default;
+}
+.mode-label.active {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.toggle {
+    position: relative;
+    display: inline-block;
+    width: 34px;
+    height: 18px;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+.toggle input {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--bg-3);
+    border: 1px solid var(--border-2);
+    border-radius: 18px;
+    transition: background 0.25s, border-color 0.25s;
+}
+
+.toggle-slider::before {
+    content: "";
+    position: absolute;
+    height: 12px;
+    width: 12px;
+    left: 2px;
+    top: 2px;
+    background: var(--text-dim);
+    border-radius: 50%;
+    transition: transform 0.25s, background 0.25s;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+}
+
+.toggle input:checked + .toggle-slider {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+.toggle input:checked + .toggle-slider::before {
+    transform: translateX(16px);
+    background: #fff;
+}
+
+.toggle input:focus-visible + .toggle-slider {
+    box-shadow: 0 0 0 2px rgba(91, 141, 239, 0.4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .toggle-slider,
+    .toggle-slider::before,
+    .mode-label { transition: none; }
+}
 
 .dot {
     width: 8px; height: 8px; border-radius: 50%;
@@ -170,7 +238,6 @@ body {
     .bar-fill { transition: none; }
 }
 
-/* ── 卡片 ── */
 .card {
     background: var(--bg-1);
     border: 1px solid var(--border);

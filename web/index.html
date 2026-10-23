@@ -38,10 +38,14 @@
                     <span id="statusLabel">连接中…</span>
                 </div>
                 <div class="topbar-right">
-                    <select id="modeSelect" class="mode-select" title="切换匿名/实名模式">
-                        <option value="anonymous">匿名模式</option>
-                        <option value="authenticated">实名模式</option>
-                    </select>
+                    <div class="mode-switch" title="匿名模式：代理池 + 伪装；实名模式：直连 + API Key">
+                        <span class="mode-label active" id="modeLabelAnonymous">匿名</span>
+                        <label class="toggle">
+                            <input type="checkbox" id="modeToggle" />
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="mode-label" id="modeLabelAuthenticated">实名</span>
+                    </div>
                     <span class="meta" id="metaPort">:8910</span>
                     <span class="meta" id="metaUpstream">opencode.ai/zen/v1</span>
                 </div>

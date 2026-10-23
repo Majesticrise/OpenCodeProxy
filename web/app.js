@@ -99,9 +99,19 @@ async function fetchSettings() {
 }
 
 function renderSettings() {
-    const sel = $('#modeSelect');
-    if (sel) sel.value = state.mode;
+    // 滑动开关状态
+    const toggle = $('#modeToggle');
+    if (toggle) toggle.checked = state.mode === 'authenticated';
 
+    // 左右标签高亮
+    const labelAnon = $('#modeLabelAnonymous');
+    const labelAuth = $('#modeLabelAuthenticated');
+    if (labelAnon && labelAuth) {
+        labelAnon.classList.toggle('active', state.mode === 'anonymous');
+        labelAuth.classList.toggle('active', state.mode === 'authenticated');
+    }
+
+    // API Key 页信息
     const statusEl = $('#apiKeyStatus');
     if (statusEl) {
         statusEl.textContent = state.hasApiKey
@@ -114,13 +124,14 @@ function renderSettings() {
     }
 }
 
-async function onModeChange(e) {
-    const mode = e.target.value;
-    if (mode === 'authenticated' && !state.hasApiKey) {
+async function onModeToggle(e) {
+    const wantAuth = e.target.checked;
+    if (wantAuth && !state.hasApiKey) {
         toast('实名模式需要先配置 API Key', 'err');
-        e.target.value = state.mode;
+        e.target.checked = false;
         return;
     }
+    const mode = wantAuth ? 'authenticated' : 'anonymous';
     try {
         const r = await fetch('/api/settings/mode', {
             method: 'POST',
@@ -130,16 +141,16 @@ async function onModeChange(e) {
         const d = await r.json();
         if (d.ok) {
             state.mode = d.mode;
-            toast(`已切换到${mode === 'anonymous' ? '匿名' : '实名'}模式`, 'ok');
+            toast(`已切换到${wantAuth ? '实名' : '匿名'}模式`, 'ok');
             renderSettings();
             await fetchStatus();
         } else {
             toast('切换失败: ' + (d.error || '未知错误'), 'err');
-            e.target.value = state.mode;
+            e.target.checked = state.mode === 'authenticated';
         }
     } catch (err) {
         toast('网络错误: ' + err.message, 'err');
-        e.target.value = state.mode;
+        e.target.checked = state.mode === 'authenticated';
     }
 }
 
@@ -711,9 +722,9 @@ function bindEvents() {
         el.addEventListener('click', () => switchView(el.dataset.view)));
     $('#toggleBtn').addEventListener('click', toggleService);
 
-    // 模式切换
-    const modeSel = $('#modeSelect');
-    if (modeSel) modeSel.addEventListener('change', onModeChange);
+    // 匿名/实名滑动开关
+    const modeToggle = $('#modeToggle');
+    if (modeToggle) modeToggle.addEventListener('change', onModeToggle);
 
     // API Key 管理
     const btnSaveKey = $('#btnSaveKey');
