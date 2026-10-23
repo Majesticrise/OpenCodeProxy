@@ -25,6 +25,8 @@ pub struct RuntimeSettings {
     pub mode: Mode,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>, // 新增
 }
 
 impl RuntimeSettings {

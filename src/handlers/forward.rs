@@ -18,6 +18,16 @@ fn impersonate() -> wreq_util::Profile {
     wreq_util::Profile::Chrome131
 }
 
+/// 实名模式专用的 Console org id（可选）。
+/// 从环境变量 `OPENCODE_ORG_ID` 读取，不落盘到 settings.json，
+/// 避免把工作区标识和密钥一起明文存储。
+fn authenticated_org_id() -> Option<String> {
+    std::env::var("OPENCODE_ORG_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn resolve_candidates(routing: &RoutingConfig, requested: &str) -> Vec<String> {
     if let Some(list) = routing.mapping.get(requested) {
         return list.clone();
@@ -258,6 +268,15 @@ async fn aggregate_sse_to_json(
 
     let bytes = serde_json::to_vec(&response_json).map_err(|e| format!("serialize: {}", e))?;
     Ok((bytes, usage))
+}
+
+/// 脱敏密钥用于日志：只显示前 7 位和后 4 位（`oc_sk_` 前缀保留）。
+fn mask_key(key: &str) -> String {
+    if key.len() <= 11 {
+        "***".to_string()
+    } else {
+        format!("{}...{}", &key[..7], &key[key.len() - 4..])
+    }
 }
 
 pub async fn chat_completions(
@@ -628,16 +647,47 @@ pub async fn chat_completions(
                 )
             };
 
-            // 实名模式：额外加 Authorization
+            // ⭐ 实名模式：注入 Authorization + 可选 x-opencode-org-id
             if is_authenticated {
                 if let Some(key) = &settings_snapshot.api_key {
                     builder = builder.header("Authorization", format!("Bearer {}", key));
+                    // 脱敏诊断日志：确认密钥格式、org 头、session 都在
+                    let org = authenticated_org_id();
+                    debug!(
+                        "authenticated request: url={} key={} org_id_set={} session={}",
+                        target_url,
+                        mask_key(key),
+                        org.is_some(),
+                        &session_id[..session_id.len().min(12)],
+                    );
+                    if let Some(org_id) = org {
+                        builder = builder.header("x-opencode-org-id", org_id);
+                    }
                 }
             }
 
             let builder = builder.header("Accept", "text/event-stream");
             match builder.json(&forward_body).send().await {
                 Ok(r) => {
+                    let status_code = r.status().as_u16();
+
+                    // ⭐ 实名模式下 401/403 时把上游 body 打出来，方便诊断
+                    if is_authenticated && (status_code == 401 || status_code == 403) {
+                        let body = r.bytes().await.unwrap_or_default();
+                        let body_str = String::from_utf8_lossy(&body);
+                        warn!(
+                            "Authenticated upstream {} error body: {}",
+                            status_code,
+                            body_str.chars().take(500).collect::<String>()
+                        );
+                        return Response::builder()
+                            .status(status_code)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap()
+                            .into_response();
+                    }
+
                     // 只有匿名模式写回绑定；实名模式总是直连，不写绑定
                     if !is_authenticated {
                         let mut bindings = state.session_proxy_binding.write().unwrap();
