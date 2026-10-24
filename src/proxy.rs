@@ -121,12 +121,41 @@ pub struct ProxyPoolInner {
     pub total_requests: AtomicU64,
 }
 
+/// 代理选择过滤规则（WebUI 可热更新，持久化在 settings.json）。
+#[derive(Clone, Debug, Default)]
+pub struct ProxyFilters {
+    /// 国家白名单（ISO 两位码，空 = 不过滤）。
+    pub country_whitelist: Vec<String>,
+    /// proxycheck 风险评分上限；None = 不过滤。未评分（None risk）的代理不受限。
+    pub max_risk: Option<u32>,
+}
+
+/// 过滤判定：白名单为空不过滤国家；risk 上限只拦截「已知超限」的代理。
+fn entry_allowed(p: &ProxyEntry, f: &ProxyFilters) -> bool {
+    if !f.country_whitelist.is_empty() {
+        match &p.info.country_code {
+            Some(cc) if f.country_whitelist.iter().any(|w| w.eq_ignore_ascii_case(cc)) => {}
+            _ => return false,
+        }
+    }
+    if let Some(max) = f.max_risk {
+        if let Some(r) = p.info.risk {
+            if r > max {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[derive(Clone)]
 pub struct ProxyPool {
     pub inner: Arc<RwLock<ProxyPoolInner>>,
     pub is_fetching: Arc<AtomicBool>,
     /// SQLite 层：信誉跨重启持久化 + IP 情报。禁用时内部方法全部 no-op。
     pub db: Arc<Db>,
+    /// 选择过滤规则（国家白名单 / 风险上限）。
+    pub filters: Arc<std::sync::RwLock<ProxyFilters>>,
 }
 
 struct FetchingReset(Arc<AtomicBool>);
@@ -147,7 +176,13 @@ impl ProxyPool {
             })),
             is_fetching: Arc::new(AtomicBool::new(false)),
             db,
+            filters: Arc::new(std::sync::RwLock::new(ProxyFilters::default())),
         }
+    }
+
+    /// 更新选择过滤规则（WebUI 保存时调用，立即生效）。
+    pub fn set_filters(&self, f: ProxyFilters) {
+        *self.filters.write().unwrap() = f;
     }
 
     pub async fn load_proxies(&self) {
@@ -515,11 +550,12 @@ impl ProxyPool {
         let inner = self.inner.read().await;
         let now = Instant::now();
         let mut rng = rand::thread_rng();
+        let filters = self.filters.read().unwrap().clone();
 
         let available: Vec<&ProxyEntry> = inner
             .proxies
             .iter()
-            .filter(|p| p.available(now))
+            .filter(|p| p.available(now) && entry_allowed(p, &filters))
             .collect();
 
         if available.is_empty() {
@@ -598,6 +634,47 @@ impl ProxyPool {
 
     pub async fn report_banned(&self, proxy_url: &str) {
         self.report_kind(proxy_url, FailureKind::Banned).await;
+    }
+
+    /// WebUI 手动拉黑：冷却 24 小时（内存 + DB），不动失败计数。
+    pub async fn manual_ban(&self, proxy_url: &str) {
+        let until_unix = now_secs() + 86400;
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
+                entry.cooldown_until = Some(Instant::now() + Duration::from_secs(86400));
+            }
+        }
+        self.db
+            .record_outcome(proxy_url, "manual_ban", Some(until_unix));
+        info!("Proxy manually banned for 24h: {}", proxy_url);
+    }
+
+    /// WebUI 手动解禁：清冷却并复位失败计数。
+    pub async fn manual_unban(&self, proxy_url: &str) {
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == proxy_url) {
+                entry.cooldown_until = None;
+                entry.fail_count = 0;
+            }
+        }
+        self.db.clear_cooldown(proxy_url);
+        info!("Proxy manually unbanned: {}", proxy_url);
+    }
+
+    /// WebUI 手动移除：出池并标记 removed（DB 历史保留，复活时信誉仍在）。
+    pub async fn manual_remove(&self, proxy_url: &str) {
+        {
+            let mut inner = self.inner.write().await;
+            let before = inner.proxies.len();
+            inner.proxies.retain(|p| p.url != proxy_url);
+            if inner.proxies.len() == before {
+                return;
+            }
+        }
+        self.db.mark_removed(proxy_url);
+        info!("Proxy manually removed: {}", proxy_url);
     }
 
     pub async fn report_success(&self, proxy_url: &str) {
@@ -958,5 +1035,42 @@ mod tests {
         assert_eq!(base.isp.as_deref(), Some("ISP X"));
         assert_eq!(base.risk, Some(30));
         assert_eq!(base.hosting, Some(true));
+    }
+
+    #[test]
+    fn entry_allowed_filter_rules() {
+        let mut e = ProxyEntry::new("http://1.1.1.1:80".into(), 0.1);
+        e.info.country_code = Some("CN".into());
+
+        // 无过滤
+        assert!(entry_allowed(&e, &ProxyFilters::default()));
+        // 国家白名单命中（大小写不敏感）
+        let f = ProxyFilters {
+            country_whitelist: vec!["cn".into()],
+            max_risk: None,
+        };
+        assert!(entry_allowed(&e, &f));
+        // 国家不在白名单
+        let f2 = ProxyFilters {
+            country_whitelist: vec!["US".into()],
+            max_risk: None,
+        };
+        assert!(!entry_allowed(&e, &f2));
+        // 未填写国家的代理在白名单模式下被拦截
+        e.info.country_code = None;
+        assert!(!entry_allowed(&e, &f));
+        e.info.country_code = Some("CN".into());
+
+        // 风险上限：已知超限拦截，未评分放行
+        let f3 = ProxyFilters {
+            country_whitelist: vec![],
+            max_risk: Some(50),
+        };
+        e.info.risk = Some(80);
+        assert!(!entry_allowed(&e, &f3));
+        e.info.risk = Some(50);
+        assert!(entry_allowed(&e, &f3), "等于上限应放行");
+        e.info.risk = None;
+        assert!(entry_allowed(&e, &f3), "未评分不受限");
     }
 }

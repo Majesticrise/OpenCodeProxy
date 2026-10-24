@@ -129,10 +129,30 @@ jobs:
           # 代理详情 / 用量报表端点（SQLite 层）
           curl -fsS http://127.0.0.1:8910/api/proxies | tee /tmp/proxies.json
           jq -e '(.proxies | type) == "array"' /tmp/proxies.json
+          jq -e '(.filters | type) == "object"' /tmp/proxies.json
 
           curl -fsS "http://127.0.0.1:8910/api/usage?days=7" | tee /tmp/usage.json
           jq -e '(.daily | type) == "array"' /tmp/usage.json
           jq -e '(.models | type) == "array"' /tmp/usage.json
+          jq -e '(.by_proxy | type) == "array"' /tmp/usage.json
+
+          # 上游健康探测（空库也应返回合法结构）
+          curl -fsS http://127.0.0.1:8910/api/upstream/health | tee /tmp/uh.json
+          jq -e '.last_24h.total >= 0' /tmp/uh.json
+
+          # 代理手动操作（空池 enrich 也应 ok）
+          curl -fsS -X POST http://127.0.0.1:8910/api/proxies/action \
+            -H 'Content-Type: application/json' \
+            -d '{"action":"enrich"}' | jq -e '.ok == true'
+
+          # 过滤规则写入 + 读回
+          curl -fsS -X POST http://127.0.0.1:8910/api/proxies/filters \
+            -H 'Content-Type: application/json' \
+            -d '{"countries":["cn","BADCODE"],"max_risk":60}' | tee /tmp/filters.json
+          jq -e '.ok == true' /tmp/filters.json
+          jq -e '.countries == ["CN"]' /tmp/filters.json
+          jq -e '.max_risk == 60' /tmp/filters.json
+          curl -fsS http://127.0.0.1:8910/api/proxies/filters | jq -e '.countries == ["CN"]'
 
       - name: Cleanup
         if: always()

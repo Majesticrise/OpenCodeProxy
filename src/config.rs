@@ -95,6 +95,26 @@ pub static PROXYCHECK_KEY: LazyLock<Option<String>> = LazyLock::new(|| {
         .filter(|s| !s.is_empty())
 });
 
+/// 上游健康探测间隔（秒）。默认 300（5 分钟），0 = 关闭探测。
+pub static PROBE_INTERVAL_SECS: LazyLock<u64> = LazyLock::new(|| {
+    env::var("PROBE_INTERVAL_SECS")
+        .unwrap_or_else(|_| "300".to_string())
+        .parse()
+        .unwrap_or(300)
+});
+
+/// 文件日志目录（按天滚动）。空串 = 不写文件日志。
+pub static LOG_DIR: LazyLock<String> =
+    LazyLock::new(|| env::var("LOG_DIR").unwrap_or_else(|_| "logs".to_string()));
+
+/// 文件日志保留天数（按文件修改时间清理）。
+pub static LOG_RETENTION_DAYS: LazyLock<i64> = LazyLock::new(|| {
+    env::var("LOG_RETENTION_DAYS")
+        .unwrap_or_else(|_| "14".to_string())
+        .parse()
+        .unwrap_or(14)
+});
+
 pub static PERSIST_METRICS: LazyLock<bool> = LazyLock::new(|| {
     env::var("PERSIST_METRICS")
         .map(|v| v != "false" && v != "0")

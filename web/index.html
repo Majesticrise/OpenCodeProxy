@@ -49,6 +49,7 @@
                         <span class="mode-label" id="modeLabelAuthenticated">实名</span>
                     </div>
                     <span class="meta" id="metaPort">:8910</span>
+                    <span class="meta" id="upstreamHealth" title="上游在线率（每5分钟探测）">上游 -</span>
                     <span class="meta" id="metaUpstream">opencode.ai/zen/v1</span>
                 </div>
             </header>
@@ -240,6 +241,15 @@
                             风险评分来自 proxycheck.io（0-100，越低越好，<code>-</code> 为未查询）；
                             类型 <code>Wireless</code> 为普通宽带/移动网络，<code>IDC</code> 为机房 IP。
                         </p>
+                        <div class="pg-row">
+                            <input id="filterCountries" class="search" style="max-width:280px"
+                                   placeholder="国家白名单，如 CN,JP（空=不过滤）" />
+                            <input id="filterRisk" class="search" type="number" min="0" max="100"
+                                   style="max-width:150px" placeholder="风险上限 0-100" />
+                            <button class="btn btn-primary" id="btnSaveFilters">保存过滤</button>
+                            <div class="spacer"></div>
+                            <button class="btn btn-ghost" id="btnEnrichNow">🌐 立即富化</button>
+                        </div>
                         <div class="table-wrap">
                             <table class="route-table">
                                 <thead>
@@ -253,6 +263,7 @@
                                         <th>延迟</th>
                                         <th>状态</th>
                                         <th>上次使用</th>
+                                        <th style="width: 90px">操作</th>
                                     </tr>
                                 </thead>
                                 <tbody id="proxyTableBody"></tbody>
@@ -292,6 +303,24 @@
                                     </tr>
                                 </thead>
                                 <tbody id="usageModelBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">按代理统计（区间内）</div>
+                        <div class="table-wrap">
+                            <table class="route-table">
+                                <thead>
+                                    <tr>
+                                        <th>代理</th>
+                                        <th>请求</th>
+                                        <th>成功率</th>
+                                        <th>Total Tokens</th>
+                                        <th>平均延迟</th>
+                                        <th>平均 TTFT</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="usageProxyBody"></tbody>
                             </table>
                         </div>
                     </div>

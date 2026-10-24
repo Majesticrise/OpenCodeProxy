@@ -723,3 +723,19 @@ select:focus { border-color: var(--accent); }
     padding: 4px 10px;
     font-size: 13px;
 }
+
+/* 代理行操作按钮 */
+.px-act {
+    background: transparent;
+    border: 1px solid #2f3643;
+    border-radius: 6px;
+    color: #aeb8c4;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 5px;
+    margin-right: 2px;
+}
+.px-act:hover {
+    border-color: #4a5468;
+    background: #232a36;
+}

@@ -339,7 +339,85 @@ async function fetchProxies() {
         if (!r.ok) return;
         const d = await r.json();
         state.proxies = d.proxies || [];
+        // 过滤规则回填到输入框（用户正在输入时不覆盖）
+        const ci = $('#filterCountries');
+        const ri = $('#filterRisk');
+        if (d.filters) {
+            if (ci && document.activeElement !== ci) {
+                ci.value = (d.filters.countries || []).join(',');
+            }
+            if (ri && document.activeElement !== ri) {
+                ri.value = d.filters.max_risk == null ? '' : String(d.filters.max_risk);
+            }
+        }
         renderProxies();
+    } catch (_) {}
+}
+
+async function proxyAction(action, url) {
+    try {
+        const r = await fetch('/api/proxies/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action, url }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+            toast(action === 'enrich' ? '富化任务已启动' : '操作成功', 'ok');
+            fetchProxies();
+        } else {
+            toast('操作失败: ' + (d.error || '未知错误'), 'err');
+        }
+    } catch (e) {
+        toast('网络错误: ' + e.message, 'err');
+    }
+}
+
+async function saveProxyFilters() {
+    const countries = ($('#filterCountries').value || '')
+        .split(/[,，\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const riskRaw = ($('#filterRisk').value || '').trim();
+    const body = {
+        countries,
+        max_risk: riskRaw === '' ? null : Math.max(0, Math.min(100, Number(riskRaw) || 0)),
+    };
+    try {
+        const r = await fetch('/api/proxies/filters', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const d = await r.json();
+        if (d.ok) {
+            toast('过滤规则已保存并生效', 'ok');
+        } else {
+            toast('保存失败: ' + (d.error || '未知错误'), 'err');
+        }
+    } catch (e) {
+        toast('网络错误: ' + e.message, 'err');
+    }
+}
+
+// ── 上游健康探测 ──
+async function fetchUpstreamHealth() {
+    const el = $('#upstreamHealth');
+    if (!el) return;
+    try {
+        const r = await fetch('/api/upstream/health');
+        if (!r.ok) return;
+        const d = await r.json();
+        const s = d.last_1h || {};
+        const s24 = d.last_24h || {};
+        if (!s.total) {
+            el.textContent = '上游 无数据';
+            el.title = '探测任务尚未积累数据';
+            return;
+        }
+        const online = Math.round(100 * (s.ok + s.restricted) / s.total);
+        el.textContent = `上游 ${online}%`;
+        el.title = `近1h: ok ${s.ok} / 受限 ${s.restricted} / 离线 ${s.down}` +
+            `\n近24h: ok ${s24.ok || 0} / 受限 ${s24.restricted || 0} / 离线 ${s24.down || 0}` +
+            `\n(ok=完全可用, 受限=上游在线但拒绝, 离线=网络不可达)`;
     } catch (_) {}
 }
 
@@ -350,7 +428,7 @@ function renderProxies() {
     $('#proxiesMeta').textContent = `${data.length} 个节点`;
 
     if (!data.length) {
-        body.innerHTML = '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
         return;
     }
     const sorted = [...data].sort((a, b) =>
@@ -366,6 +444,7 @@ function renderProxies() {
             ? '<span class="ok-text">可用</span>'
             : `冷却 ${p.cooldown_remaining_secs ?? 0}s`;
         const lastUsed = p.last_used ? new Date(p.last_used * 1000).toLocaleString() : '-';
+        const u = escapeHtml(p.url);
         return `<tr>
             <td class="mono">${escapeHtml(p.url.replace(/^https?:\/\//, ''))}</td>
             <td>${escapeHtml(p.country_code || '-')}${p.country ? `<br><span class="dim-text">${escapeHtml(p.country)}</span>` : ''}</td>
@@ -376,6 +455,11 @@ function renderProxies() {
             <td>${p.latency > 0 ? p.latency.toFixed(2) + 's' : '-'}</td>
             <td>${status}</td>
             <td class="dim-text">${escapeHtml(lastUsed)}</td>
+            <td>
+                <button class="px-act" data-act="ban" data-url="${u}" title="拉黑24小时">🚫</button>
+                <button class="px-act" data-act="unban" data-url="${u}" title="解禁">✅</button>
+                <button class="px-act" data-act="remove" data-url="${u}" title="移除">🗑️</button>
+            </td>
         </tr>`;
     }).join('');
 }
@@ -389,8 +473,26 @@ async function fetchUsage() {
         if (!r.ok) return;
         state.usage = await r.json();
         renderUsageModels(state.usage.models || []);
+        renderUsageProxies(state.usage.by_proxy || []);
         drawUsageChart();
     } catch (_) {}
+}
+
+function renderUsageProxies(rows) {
+    const body = $('#usageProxyBody');
+    if (!body) return;
+    if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="6" class="empty">暂无数据</td></tr>';
+        return;
+    }
+    body.innerHTML = rows.map((p) => `<tr>
+        <td class="mono">${escapeHtml(p.proxy.replace(/^https?:\/\//, ''))}</td>
+        <td>${fmtExact(p.requests)}</td>
+        <td>${p.requests > 0 ? (100 * p.success / p.requests).toFixed(1) + '%' : '-'}</td>
+        <td>${fmtExact(p.total_tokens)}</td>
+        <td>${p.avg_latency_ms ? fmtNum(p.avg_latency_ms) + 'ms' : '-'}</td>
+        <td>${p.avg_ttft_ms ? fmtNum(p.avg_ttft_ms) + 'ms' : '-'}</td>
+    </tr>`).join('');
 }
 
 function renderUsageModels(models) {
@@ -918,6 +1020,23 @@ function bindEvents() {
     $('#btnProbe').addEventListener('click', () => loadUpstreamModels(true));
     const usageDays = $('#usageDays');
     if (usageDays) usageDays.addEventListener('change', fetchUsage);
+
+    // 代理页：行操作（事件委托，tbody 不随 innerHTML 重建）
+    const proxyBody = $('#proxyTableBody');
+    if (proxyBody) {
+        proxyBody.addEventListener('click', (e) => {
+            const btn = e.target.closest('.px-act');
+            if (!btn) return;
+            const act = btn.dataset.act;
+            const url = btn.dataset.url;
+            if (act === 'remove' && !confirm(`确定移除代理 ${url}？（历史信誉保留，可重新验证复活）`)) return;
+            proxyAction(act, url);
+        });
+    }
+    const btnSaveFilters = $('#btnSaveFilters');
+    if (btnSaveFilters) btnSaveFilters.addEventListener('click', saveProxyFilters);
+    const btnEnrichNow = $('#btnEnrichNow');
+    if (btnEnrichNow) btnEnrichNow.addEventListener('click', () => proxyAction('enrich', null));
     $('#btnAddRule').addEventListener('click', () => {
         state.routeRows.push({ key: '', candidates: '' });
         renderRouteTable();
@@ -966,6 +1085,8 @@ function startPolling() {
         if (state.view === 'proxies') fetchProxies();
         else if (state.view === 'usage') fetchUsage();
     }, 3000));
+    // 上游健康：15s 一次，全局显示
+    _timers.push(setInterval(fetchUpstreamHealth, 15000));
 }
 function stopPolling() {
     _timers.forEach(clearInterval);
@@ -980,6 +1101,7 @@ async function init() {
         fetchLogs(),
         fetchSettings(),
         loadModels(),
+        fetchUpstreamHealth(),
     ]);
     startPolling();
 }

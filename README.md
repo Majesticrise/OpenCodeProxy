@@ -28,6 +28,8 @@
 | 📊 | **实时指标持久化** | 总请求数、成功率、Token 用量跨重启累计，P95 延迟实时计算 |
 | 🗄️ | **SQLite 数据库** | 代理信誉（成功/失败/风控/冷却/上次使用）跨重启保留；请求明细（token 计量/TTFT/代理归属）落库 |
 | 🌐 | **IP 情报富化** | ip-api.com 批量查国家/ISP/ASN/机房识别，可选 proxycheck.io 风险评分（iplark 同类信息），参与冷启动选优 |
+| 🩺 | **上游健康探测** | 每 5 分钟直连探测，区分「上游挂了」与「代理不行」，顶栏实时在线率 |
+| 📒 | **文件日志** | 按天滚动写入 `logs/`，自动清理过期文件，重启不丢历史日志 |
 | 🖥️ | **内置 WebUI** | 仪表盘 / 实时日志 / Playground / 路由配置，零额外部署 |
 | 🔌 | **连接池复用** | `DashMap` 按代理 URL 缓存 `wreq::Client`（Chrome131 TLS 指纹模拟），超量自动清理 |
 
@@ -201,6 +203,9 @@ WebUI 顶栏滑动开关热切换，无需重启：
 | `ZEN_DB` | `zen.db` | SQLite 路径（代理信誉 + 请求明细），空串禁用 |
 | `REQUEST_LOG_DAYS` | `90` | 请求明细保留天数（0 = 永久保留） |
 | `PROXYCHECK_KEY` | 空 | proxycheck.io 免费 key，启用 IP 风险评分（免费 1000 次/天） |
+| `PROBE_INTERVAL_SECS` | `300` | 上游健康探测间隔（秒），0 = 关闭 |
+| `LOG_DIR` | `logs` | 文件日志目录（按天滚动），空串 = 不写文件日志 |
+| `LOG_RETENTION_DAYS` | `14` | 文件日志保留天数 |
 
 > 持久化只存**累计总量**（总请求数、成功率、Token 用量）。P95 延迟、每分钟图表只反映最近 60 分钟的实时窗口，重启后从空开始。
 
@@ -245,11 +250,14 @@ WebUI 顶栏滑动开关热切换，无需重启：
 - 代理信誉表：成功 / 失败 / 风控次数（SQLite 跨重启累计）
 - IP 情报：国家 / ISP / ASN / 使用场景 / 风险评分（来自 ip-api.com 与 proxycheck.io）
 - 实时状态：延迟、冷却倒计时、上次使用时间
+- 手动管理：单行拉黑（24h）/ 解禁 / 移除，一键立即富化
+- 过滤规则：国家白名单 + 风险评分上限，保存即生效（持久化到 settings.json）
 
 ### 用量报表
 
 - 按天 Token 用量图表（SQLite 请求明细聚合，不再只有 1 小时窗口）
 - 按模型统计：请求量、成功率、Token 三项、平均延迟、平均首字延迟（TTFT）
+- 按代理统计：每个代理服务的请求量 / 成功率 / Token / 平均延迟
 
 ### API Key 与运行模式
 
@@ -361,7 +369,10 @@ zen-proxy/
 | `GET` | `/api/upstream/models` | 缓存的上游模型列表 |
 | `POST` | `/api/upstream/refresh` | 主动探测上游并刷新缓存 |
 | `GET` | `/api/proxies` | 代理池详情（信誉 / IP 情报 / 冷却状态） |
-| `GET` | `/api/usage?days=14` | 用量报表（按天 / 按模型聚合，来自 SQLite 明细） |
+| `POST` | `/api/proxies/action` | 代理手动操作（ban / unban / remove / enrich） |
+| `GET/POST` | `/api/proxies/filters` | 读取/保存代理过滤规则（国家白名单 + 风险上限） |
+| `GET` | `/api/upstream/health` | 上游健康探测汇总（近 1h / 24h） |
+| `GET` | `/api/usage?days=14` | 用量报表（按天 / 按模型 / 按代理聚合，来自 SQLite 明细） |
 
 ---
 

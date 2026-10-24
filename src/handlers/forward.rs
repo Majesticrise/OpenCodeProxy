@@ -324,7 +324,8 @@ fn mask_key(key: &str) -> String {
 /// 客户端已显式设置的字段值不覆盖（例如显式传了 `include_usage: false` 就尊重之），
 /// 只在缺失时补 `true`。此前用 `entry().or_insert_with()` 整体写入，客户端传
 /// `{"stream_options":{}}` 时 `include_usage` 不会被补上，导致拿不到真实 usage。
-fn force_stream_options(body: &mut serde_json::Value) {
+/// 探测任务（probe.rs）复用同一函数保持伪装契约一致。
+pub(crate) fn force_stream_options(body: &mut serde_json::Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };

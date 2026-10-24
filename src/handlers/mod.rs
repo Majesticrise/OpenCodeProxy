@@ -9,7 +9,7 @@ pub use forward::chat_completions;
 pub use models::list_models;
 pub use routing::{api_get_routing, api_set_routing};
 pub use settings::{api_get_settings, api_set_api_key, api_set_mode};
-pub use stats::{api_proxies, api_usage};
+pub use stats::{api_get_filters, api_proxies, api_proxy_action, api_set_filters, api_upstream_health, api_usage};
 pub use upstream::{api_upstream_models, api_upstream_refresh};
 
 use axum::{

@@ -5,6 +5,7 @@ mod logger;
 mod metrics;
 mod middleware;
 mod opencode_identity;
+mod probe;
 mod proxy;
 mod settings;
 mod state;
@@ -38,12 +39,27 @@ async fn main() {
     let log_buffer = Arc::new(LogBuffer::new());
     let filter = env::var("RUST_LOG").unwrap_or_else(|_| config::LOG_LEVEL.to_string());
 
+    // 文件日志：按天滚动写入 LOG_DIR（tracing-appender 自动建目录），保留 N 天
+    let file_layer = if config::LOG_DIR.is_empty() {
+        None
+    } else {
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(tracing_appender::rolling::daily(
+                    &*config::LOG_DIR,
+                    "zen.log",
+                )),
+        )
+    };
+
     let subscriber = tracing_subscriber::registry()
         .with(EnvFilter::new(filter))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())),
         )
+        .with(file_layer)
         .with(LogLayer::new(log_buffer.clone()));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
@@ -54,13 +70,30 @@ async fn main() {
     // ── SQLite（代理信誉 + 请求明细；ZEN_DB 为空串时禁用） ──
     let db = Arc::new(db::Db::open(&config::ZEN_DB));
     db.prune_requests(*config::REQUEST_LOG_DAYS);
-    let db_prune = db.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(86400)).await;
-            db_prune.prune_requests(*config::REQUEST_LOG_DAYS);
-        }
-    });
+    cleanup_old_logs(&config::LOG_DIR, *config::LOG_RETENTION_DAYS);
+    {
+        let db_prune = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(86400)).await;
+                db_prune.prune_requests(*config::REQUEST_LOG_DAYS);
+                cleanup_old_logs(&config::LOG_DIR, *config::LOG_RETENTION_DAYS);
+            }
+        });
+    }
+
+    // ── 上游健康探测（PROBE_INTERVAL_SECS=0 关闭） ──
+    if *config::PROBE_INTERVAL_SECS > 0 {
+        let probe_db = db.clone();
+        tokio::spawn(async move {
+            // 避开启动高峰，30s 后开始第一针
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            loop {
+                probe::probe_once(&probe_db).await;
+                tokio::time::sleep(Duration::from_secs(*config::PROBE_INTERVAL_SECS)).await;
+            }
+        });
+    }
 
     // ── 代理池 ──
     let proxy_pool = ProxyPool::new(&config::PROXY_FILE, db.clone());
@@ -98,8 +131,16 @@ async fn main() {
         );
     }
 
-    // ── 运行时设置（匿名/实名模式 + API Key） ──
+    // ── 运行时设置（匿名/实名模式 + API Key + 代理过滤规则） ──
     let settings = Arc::new(RwLock::new(RuntimeSettings::load()));
+    {
+        // 把 settings.json 里的过滤规则同步进代理池（立即生效）
+        let s = settings.read().unwrap();
+        proxy_pool.set_filters(proxy::ProxyFilters {
+            country_whitelist: s.proxy_country_whitelist.clone(),
+            max_risk: s.proxy_max_risk,
+        });
+    }
 
     // ── Metrics ──
     let metrics_path = if *config::PERSIST_METRICS {
@@ -149,6 +190,12 @@ async fn main() {
         .route("/api/upstream/refresh", post(handlers::api_upstream_refresh))
         // 数据库报表
         .route("/api/proxies", get(handlers::api_proxies))
+        .route("/api/proxies/action", post(handlers::api_proxy_action))
+        .route(
+            "/api/proxies/filters",
+            get(handlers::api_get_filters).post(handlers::api_set_filters),
+        )
+        .route("/api/upstream/health", get(handlers::api_upstream_health))
         .route("/api/usage", get(handlers::api_usage))
         // 运行时设置
         .route("/api/settings", get(handlers::api_get_settings))
@@ -175,6 +222,43 @@ async fn main() {
     // 优雅退出：把最近 5s 窗口内还没落盘的累计指标写掉
     info!("Shutdown: flushing metrics totals...");
     metrics_for_flush.flush_blocking();
+}
+
+/// 清理过期的滚动日志文件（按文件修改时间判断，而非解析文件名）。
+fn cleanup_old_logs(dir: &str, keep_days: i64) {
+    if dir.is_empty() || keep_days <= 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 - keep_days * 86400)
+        .unwrap_or(0);
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(secs) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        if (secs.as_secs() as i64) < cutoff {
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        info!("Removed {} log files older than {}d from {}", removed, keep_days, dir);
+    }
 }
 
 /// Ctrl+C（以及 Unix 下的 SIGTERM）触发优雅停机。

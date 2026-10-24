@@ -30,6 +30,12 @@ pub struct RuntimeSettings {
     /// 这里保留字段是为了将来支持在 WebUI 里配置并落盘。
     #[serde(default)]
     pub org_id: Option<String>,
+    /// 代理过滤：国家白名单（ISO 3166-1 两位码，空 = 不过滤）。
+    #[serde(default)]
+    pub proxy_country_whitelist: Vec<String>,
+    /// 代理过滤：proxycheck 风险评分上限（None = 不过滤；未评分代理不受限）。
+    #[serde(default)]
+    pub proxy_max_risk: Option<u32>,
 }
 
 impl RuntimeSettings {
@@ -125,6 +131,7 @@ mod tests {
             mode: Mode::Anonymous,
             api_key: Some("sk-1234567890abcdef".to_string()),
             org_id: None,
+            ..Default::default()
         };
         assert_eq!(s.masked_api_key(), Some("sk-1...cdef".to_string()));
     }
@@ -135,6 +142,7 @@ mod tests {
             mode: Mode::Anonymous,
             api_key: Some("short".to_string()),
             org_id: None,
+            ..Default::default()
         };
         assert_eq!(s.masked_api_key(), Some("***".to_string()));
     }
@@ -151,6 +159,7 @@ mod tests {
             mode: Mode::Authenticated,
             api_key: Some("sk-test".to_string()),
             org_id: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: RuntimeSettings = serde_json::from_str(&json).unwrap();
@@ -165,6 +174,7 @@ mod tests {
             mode: Mode::Authenticated,
             api_key: Some("oc_sk_test".to_string()),
             org_id: Some("org_abc123".to_string()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: RuntimeSettings = serde_json::from_str(&json).unwrap();

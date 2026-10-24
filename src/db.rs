@@ -119,6 +119,13 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
+
+        CREATE TABLE IF NOT EXISTS upstream_probes (
+            ts         INTEGER PRIMARY KEY,
+            result     TEXT NOT NULL,
+            status     INTEGER,
+            latency_ms INTEGER NOT NULL DEFAULT 0
+        );
         ",
     )?;
     conn.pragma_update(None, "user_version", 1)?;
@@ -219,6 +226,11 @@ impl Db {
                  cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
                 params![url, now, cooldown],
             ),
+            "manual_ban" => self.conn.lock().unwrap().execute(
+                "UPDATE proxies SET last_used = ?2,
+                 cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
+                params![url, now, cooldown],
+            ),
             "ban" => self.conn.lock().unwrap().execute(
                 "UPDATE proxies SET ban_count = ban_count + 1, last_used = ?2,
                  cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
@@ -244,6 +256,19 @@ impl Db {
             params![url],
         ) {
             warn!("db mark_removed failed: {}", e);
+        }
+    }
+
+    /// 手动解禁：清冷却并复位失败计数（内存与 DB 一致）。
+    pub fn clear_cooldown(&self, url: &str) {
+        if !self.enabled {
+            return;
+        }
+        if let Err(e) = self.conn.lock().unwrap().execute(
+            "UPDATE proxies SET cooldown_until = 0, fail_count = 0 WHERE url = ?1",
+            params![url],
+        ) {
+            warn!("db clear_cooldown failed: {}", e);
         }
     }
 
@@ -380,21 +405,104 @@ impl Db {
         }
     }
 
-    /// 清理过期请求明细。days <= 0 不清理。
+    /// 清理过期明细（requests + upstream_probes）。days <= 0 不清理。
     pub fn prune_requests(&self, days: i64) {
         if !self.enabled || days <= 0 {
             return;
         }
         let cutoff = now_secs() - days * 86400;
-        match self
-            .conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM requests WHERE ts < ?1", params![cutoff])
-        {
+        let conn = self.conn.lock().unwrap();
+        match conn.execute("DELETE FROM requests WHERE ts < ?1", params![cutoff]) {
             Ok(n) if n > 0 => info!("Pruned {} expired request rows (>{}d)", n, days),
             Ok(_) => {}
             Err(e) => warn!("db prune_requests failed: {}", e),
+        }
+        match conn.execute("DELETE FROM upstream_probes WHERE ts < ?1", params![cutoff]) {
+            Ok(n) if n > 0 => info!("Pruned {} expired probe rows (>{}d)", n, days),
+            Ok(_) => {}
+            Err(e) => warn!("db prune_probes failed: {}", e),
+        }
+    }
+
+    /// 记录一次上游健康探测。result: ok / restricted / down。
+    pub fn record_probe(&self, ts: i64, result: &str, status: Option<u16>, latency_ms: u64) {
+        if !self.enabled {
+            return;
+        }
+        if let Err(e) = self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO upstream_probes (ts, result, status, latency_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![ts, result, status, latency_ms as i64],
+        ) {
+            warn!("db record_probe failed: {}", e);
+        }
+    }
+
+    /// 探测汇总：(total, ok, restricted, down)。
+    pub fn probe_summary(&self, since_unix: i64) -> (i64, i64, i64, i64) {
+        if !self.enabled {
+            return (0, 0, 0, 0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) =
+            conn.prepare("SELECT result, COUNT(*) FROM upstream_probes WHERE ts >= ?1 GROUP BY result")
+        else {
+            return (0, 0, 0, 0);
+        };
+        let rows = stmt.query_map(params![since_unix], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        });
+        let mut out = (0i64, 0, 0, 0);
+        if let Ok(iter) = rows {
+            for row in iter.flatten() {
+                out.0 += row.1;
+                match row.0.as_str() {
+                    "ok" => out.1 += row.1,
+                    "restricted" => out.2 += row.1,
+                    _ => out.3 += row.1,
+                }
+            }
+        }
+        out
+    }
+
+    /// 按代理聚合请求统计（requests 表 proxy_url 维度）。
+    pub fn usage_proxies(&self, since_unix: i64) -> Vec<UsageProxyRow> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT proxy_url, COUNT(*), SUM(status BETWEEN 200 AND 399),
+                    SUM(COALESCE(NULLIF(total_tokens,0),0)),
+                    CAST(AVG(latency_ms) AS INTEGER),
+                    CAST(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS INTEGER)
+             FROM requests
+             WHERE ts >= ?1 AND proxy_url IS NOT NULL AND proxy_url != ''
+             GROUP BY proxy_url ORDER BY COUNT(*) DESC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("db usage_proxies prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+        let rows = stmt.query_map(params![since_unix], |r| {
+            Ok(UsageProxyRow {
+                proxy_url: r.get(0)?,
+                requests: r.get::<_, i64>(1)?,
+                success: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                total_tokens: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                avg_latency_ms: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                avg_ttft_ms: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|row| row.ok()).collect(),
+            Err(e) => {
+                warn!("db usage_proxies query failed: {}", e);
+                Vec::new()
+            }
         }
     }
 
@@ -485,6 +593,15 @@ pub struct UsageModelRow {
     pub total_tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub avg_latency_ms: i64,
+    pub avg_ttft_ms: i64,
+}
+
+pub struct UsageProxyRow {
+    pub proxy_url: String,
+    pub requests: i64,
+    pub success: i64,
+    pub total_tokens: i64,
     pub avg_latency_ms: i64,
     pub avg_ttft_ms: i64,
 }
@@ -580,6 +697,11 @@ mod tests {
         assert_eq!(r.info.risk, Some(75));
         assert_eq!(r.info.hosting, Some(false));
 
+        // 手动解禁：清冷却并复位失败计数
+        db.clear_cooldown("http://1.2.3.4:8080");
+        let rows = db.load_active_proxies();
+        assert_eq!(rows[0].cooldown_until_unix, 0, "clear_cooldown 应清掉冷却");
+
         // 移除后不再加载，但行保留（重新 upsert 会复活）
         db.mark_removed("http://1.2.3.4:8080");
         assert!(db.load_active_proxies().is_empty());
@@ -631,6 +753,22 @@ mod tests {
         assert_eq!(models[0].requests, 4);
         assert_eq!(models[0].success, 3);
         assert_eq!(models[0].total_tokens, 60);
+
+        // 按代理聚合（proxy_url 为 NULL 的行不计入）
+        let by_proxy = db.usage_proxies(base - 1);
+        assert_eq!(by_proxy.len(), 1);
+        assert_eq!(by_proxy[0].proxy_url, "http://1.2.3.4:8080");
+        assert_eq!(by_proxy[0].requests, 4);
+        assert_eq!(by_proxy[0].success, 3);
+        assert_eq!(by_proxy[0].total_tokens, 60);
+
+        // 上游健康探测记录与汇总
+        db.record_probe(now - 60, "ok", Some(200), 120);
+        db.record_probe(now - 120, "down", None, 5000);
+        db.record_probe(now - 180, "restricted", Some(403), 200);
+        assert_eq!(db.probe_summary(now - 3600), (3, 1, 1, 1));
+        assert_eq!(db.probe_summary(now - 86400 * 2), (3, 1, 1, 1));
+        assert_eq!(db.probe_summary(now), (0, 0, 0, 0), "未来窗口应为空");
 
         // 两天前插一条旧记录；prune(1天) 只应清掉它，今天的 4 条保留
         db.record_request(&RequestRecord {
