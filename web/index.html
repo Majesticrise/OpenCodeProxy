@@ -22,6 +22,8 @@
                 <a class="nav-item" data-view="routing"><span>🧭</span>模型路由</a>
                 <a class="nav-item" data-view="logs"><span>📋</span>实时日志</a>
                 <a class="nav-item" data-view="playground"><span>🧪</span>Playground</a>
+                <a class="nav-item" data-view="proxies"><span>🛡️</span>代理详情</a>
+                <a class="nav-item" data-view="usage"><span>📈</span>用量报表</a>
                 <a class="nav-item" data-view="apikey"><span>🔑</span>API Key</a>
                 <a class="nav-item" data-view="config"><span>⚙️</span>配置</a>
             </nav>
@@ -224,6 +226,74 @@
                     <div class="card">
                         <div class="card-title">响应</div>
                         <pre class="response" id="pgResponse"></pre>
+                    </div>
+                </section>
+
+                <!-- 代理详情 -->
+                <section class="view" id="view-proxies">
+                    <div class="card">
+                        <div class="card-title">
+                            <span>代理池详情（信誉与 IP 情报跨重启持久化）</span>
+                            <span class="muted" id="proxiesMeta">-</span>
+                        </div>
+                        <p class="muted">
+                            风险评分来自 proxycheck.io（0-100，越低越好，<code>-</code> 为未查询）；
+                            类型 <code>Wireless</code> 为普通宽带/移动网络，<code>IDC</code> 为机房 IP。
+                        </p>
+                        <div class="table-wrap">
+                            <table class="route-table">
+                                <thead>
+                                    <tr>
+                                        <th>代理</th>
+                                        <th>国家</th>
+                                        <th>ISP / ASN</th>
+                                        <th>类型</th>
+                                        <th>风险</th>
+                                        <th>成功/失败/风控</th>
+                                        <th>延迟</th>
+                                        <th>状态</th>
+                                        <th>上次使用</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="proxyTableBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 用量报表 -->
+                <section class="view" id="view-usage">
+                    <div class="card">
+                        <div class="card-title">
+                            <span>每日 Token 用量（SQLite 明细聚合）</span>
+                            <select id="usageDays">
+                                <option value="7">最近 7 天</option>
+                                <option value="14" selected>最近 14 天</option>
+                                <option value="30">最近 30 天</option>
+                                <option value="90">最近 90 天</option>
+                            </select>
+                        </div>
+                        <canvas id="chartUsage" height="160"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">按模型统计（区间内）</div>
+                        <div class="table-wrap">
+                            <table class="route-table">
+                                <thead>
+                                    <tr>
+                                        <th>模型</th>
+                                        <th>请求</th>
+                                        <th>成功率</th>
+                                        <th>Prompt</th>
+                                        <th>Completion</th>
+                                        <th>Total</th>
+                                        <th>平均延迟</th>
+                                        <th>平均 TTFT</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="usageModelBody"></tbody>
+                            </table>
+                        </div>
                     </div>
                 </section>
 

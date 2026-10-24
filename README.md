@@ -26,6 +26,8 @@
 | 🧭 | **模型路由与 fallback** | 客户端模型名 → 上游候选列表，模型不可用时自动切换下一个 |
 | ⚡ | **流式 / 非流式自适应** | 上游永远流式（伪装要求），下游非流式时网关内自动聚合 |
 | 📊 | **实时指标持久化** | 总请求数、成功率、Token 用量跨重启累计，P95 延迟实时计算 |
+| 🗄️ | **SQLite 数据库** | 代理信誉（成功/失败/风控/冷却/上次使用）跨重启保留；请求明细（token 计量/TTFT/代理归属）落库 |
+| 🌐 | **IP 情报富化** | ip-api.com 批量查国家/ISP/ASN/机房识别，可选 proxycheck.io 风险评分（iplark 同类信息），参与冷启动选优 |
 | 🖥️ | **内置 WebUI** | 仪表盘 / 实时日志 / Playground / 路由配置，零额外部署 |
 | 🔌 | **连接池复用** | `DashMap` 按代理 URL 缓存 `wreq::Client`（Chrome131 TLS 指纹模拟），超量自动清理 |
 
@@ -196,6 +198,9 @@ WebUI 顶栏滑动开关热切换，无需重启：
 |---|---|---|
 | `PERSIST_METRICS` | `true` | 是否把累计指标写入磁盘 |
 | `METRICS_FILE` | `metrics_totals.json` | 持久化文件路径 |
+| `ZEN_DB` | `zen.db` | SQLite 路径（代理信誉 + 请求明细），空串禁用 |
+| `REQUEST_LOG_DAYS` | `90` | 请求明细保留天数（0 = 永久保留） |
+| `PROXYCHECK_KEY` | 空 | proxycheck.io 免费 key，启用 IP 风险评分（免费 1000 次/天） |
 
 > 持久化只存**累计总量**（总请求数、成功率、Token 用量）。P95 延迟、每分钟图表只反映最近 60 分钟的实时窗口，重启后从空开始。
 
@@ -235,6 +240,17 @@ WebUI 顶栏滑动开关热切换，无需重启：
 - 支持 `*` 通配兜底
 - 保存后**热生效**，无需重启
 
+### 代理详情
+
+- 代理信誉表：成功 / 失败 / 风控次数（SQLite 跨重启累计）
+- IP 情报：国家 / ISP / ASN / 使用场景 / 风险评分（来自 ip-api.com 与 proxycheck.io）
+- 实时状态：延迟、冷却倒计时、上次使用时间
+
+### 用量报表
+
+- 按天 Token 用量图表（SQLite 请求明细聚合，不再只有 1 小时窗口）
+- 按模型统计：请求量、成功率、Token 三项、平均延迟、平均首字延迟（TTFT）
+
 ### API Key 与运行模式
 
 - 顶栏匿名/实名滑动开关（实名需先配置 Key）
@@ -255,6 +271,7 @@ zen-proxy/
 │   ├── config.rs                # 环境变量 → 静态配置 + 运行时路由
 │   ├── state.rs                 # AppState：共享状态的聚合
 │   ├── logger.rs                # 自定义 tracing Layer，写入 Web 缓冲
+│   ├── db.rs                    # ⭐ SQLite：代理信誉 + 请求明细 + IP 情报
 │   ├── metrics.rs               # 指标采集 + 持久化 + MetricsGuard RAII
 │   ├── middleware.rs            # 剥离 Authorization
 │   ├── settings.rs              # 运行时设置（匿名/实名模式 + API Key）
@@ -266,6 +283,7 @@ zen-proxy/
 │       ├── models.rs            # /v1/models
 │       ├── routing.rs           # /api/routing 读写
 │       ├── settings.rs          # /api/settings/* 模式与密钥管理
+│       ├── stats.rs             # /api/proxies 与 /api/usage 报表
 │       └── upstream.rs          # /api/upstream/* 探测与缓存
 └── web/
     ├── index.html               # 单页多视图
@@ -342,6 +360,8 @@ zen-proxy/
 | `POST` | `/api/settings/apikey` | 设置/清除 API Key |
 | `GET` | `/api/upstream/models` | 缓存的上游模型列表 |
 | `POST` | `/api/upstream/refresh` | 主动探测上游并刷新缓存 |
+| `GET` | `/api/proxies` | 代理池详情（信誉 / IP 情报 / 冷却状态） |
+| `GET` | `/api/usage?days=14` | 用量报表（按天 / 按模型聚合，来自 SQLite 明细） |
 
 ---
 

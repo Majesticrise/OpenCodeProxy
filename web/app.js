@@ -65,6 +65,9 @@ const state = {
     mode: 'anonymous',
     hasApiKey: false,
     apiKeyMasked: null,
+    // 代理详情 / 用量报表
+    proxies: [],
+    usage: null,
 };
 
 // ── 视图切换 ──
@@ -81,6 +84,10 @@ function switchView(name) {
         loadUpstreamModels();
     } else if (name === 'playground') {
         loadModels();
+    } else if (name === 'proxies') {
+        fetchProxies();
+    } else if (name === 'usage') {
+        fetchUsage();
     } else if (name === 'apikey') {
         fetchSettings();
     }
@@ -323,6 +330,152 @@ function renderStatusList(endpoints) {
             <div class="bar-val">${fmtExact(count)}</div>
         </div>`;
     }).join('');
+}
+
+// ── 代理详情（信誉 + IP 情报） ──
+async function fetchProxies() {
+    try {
+        const r = await fetch('/api/proxies');
+        if (!r.ok) return;
+        const d = await r.json();
+        state.proxies = d.proxies || [];
+        renderProxies();
+    } catch (_) {}
+}
+
+function renderProxies() {
+    const body = $('#proxyTableBody');
+    if (!body) return;
+    const data = state.proxies || [];
+    $('#proxiesMeta').textContent = `${data.length} 个节点`;
+
+    if (!data.length) {
+        body.innerHTML = '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
+        return;
+    }
+    const sorted = [...data].sort((a, b) =>
+        (b.success_count - a.success_count) ||
+        ((a.risk ?? 999) - (b.risk ?? 999)));
+    body.innerHTML = sorted.map((p) => {
+        const risk = p.risk == null ? '-' : String(p.risk);
+        const riskCls = p.risk == null ? '' :
+            p.risk >= 75 ? 'err-text' : p.risk >= 40 ? 'warn-text' : 'ok-text';
+        const type = p.ip_type || (p.hosting ? 'IDC' : '-');
+        const isp = [p.isp, p.asn].filter(Boolean).map(escapeHtml).join('<br>') || '-';
+        const status = p.available
+            ? '<span class="ok-text">可用</span>'
+            : `冷却 ${p.cooldown_remaining_secs ?? 0}s`;
+        const lastUsed = p.last_used ? new Date(p.last_used * 1000).toLocaleString() : '-';
+        return `<tr>
+            <td class="mono">${escapeHtml(p.url.replace(/^https?:\/\//, ''))}</td>
+            <td>${escapeHtml(p.country_code || '-')}${p.country ? `<br><span class="dim-text">${escapeHtml(p.country)}</span>` : ''}</td>
+            <td class="dim-text">${isp}</td>
+            <td>${escapeHtml(type)}</td>
+            <td class="${riskCls}">${risk}</td>
+            <td>${p.success_count} / ${p.fail_count} / ${p.ban_count}</td>
+            <td>${p.latency > 0 ? p.latency.toFixed(2) + 's' : '-'}</td>
+            <td>${status}</td>
+            <td class="dim-text">${escapeHtml(lastUsed)}</td>
+        </tr>`;
+    }).join('');
+}
+
+// ── 用量报表（SQLite 明细聚合） ──
+async function fetchUsage() {
+    const sel = $('#usageDays');
+    const days = sel ? Number(sel.value) || 14 : 14;
+    try {
+        const r = await fetch(`/api/usage?days=${days}`);
+        if (!r.ok) return;
+        state.usage = await r.json();
+        renderUsageModels(state.usage.models || []);
+        drawUsageChart();
+    } catch (_) {}
+}
+
+function renderUsageModels(models) {
+    const body = $('#usageModelBody');
+    if (!body) return;
+    if (!models.length) {
+        body.innerHTML = '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+        return;
+    }
+    body.innerHTML = models.map((m) => `<tr>
+        <td>${escapeHtml(m.model)}</td>
+        <td>${fmtExact(m.requests)}</td>
+        <td>${m.requests > 0 ? (100 * m.success / m.requests).toFixed(1) + '%' : '-'}</td>
+        <td>${fmtExact(m.prompt_tokens)}</td>
+        <td>${fmtExact(m.completion_tokens)}</td>
+        <td>${fmtExact(m.total_tokens)}</td>
+        <td>${m.avg_latency_ms ? fmtNum(m.avg_latency_ms) + 'ms' : '-'}</td>
+        <td>${m.avg_ttft_ms ? fmtNum(m.avg_ttft_ms) + 'ms' : '-'}</td>
+    </tr>`).join('');
+}
+
+function drawUsageChart() {
+    const canvas = $('#chartUsage');
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+    const data = (state.usage && state.usage.daily) || [];
+    if (!data.length) {
+        ctx.fillStyle = '#7d8794';
+        ctx.font = '13px -apple-system, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('暂无数据', W / 2, H / 2);
+        return;
+    }
+    const padL = 52, padR = 12, padT = 8, padB = 22;
+    const cw = W - padL - padR;
+    const ch = H - padT - padB;
+    const maxVal = Math.max(...data.map((d) => d[5]), 1);
+    ctx.strokeStyle = '#2f3643';
+    ctx.lineWidth = 1;
+    ctx.font = '10px -apple-system, sans-serif';
+    ctx.fillStyle = '#7d8794';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+        const y = padT + (ch * i) / 4 + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(padL + cw, y);
+        ctx.stroke();
+        ctx.fillText(fmtNum(Math.round(maxVal * (1 - i / 4))), padL - 6, y);
+    }
+    const slotW = cw / data.length;
+    const barW = Math.max(2, Math.min(22, slotW - 5));
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    const labelStep = Math.max(1, Math.ceil(data.length / 10));
+    data.forEach((d, i) => {
+        const v = d[5];
+        const h = ch * (v / maxVal);
+        const x = padL + slotW * i + (slotW - barW) / 2;
+        const y = padT + ch - h;
+        const grad = ctx.createLinearGradient(0, y, 0, y + h);
+        grad.addColorStop(0, '#7affc4');
+        grad.addColorStop(1, '#2e9e73');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x, y, barW, h);
+        if (i % labelStep === 0) {
+            const date = new Date(d[0] * 86400 * 1000);
+            ctx.fillStyle = '#7d8794';
+            ctx.fillText(
+                `${date.getMonth() + 1}/${date.getDate()}`,
+                padL + slotW * i + slotW / 2,
+                padT + ch + 5
+            );
+        }
+    });
 }
 
 // ── 图表 ──
@@ -762,6 +915,8 @@ function bindEvents() {
     $('#logClear').addEventListener('click', clearLogs);
 
     $('#btnProbe').addEventListener('click', () => loadUpstreamModels(true));
+    const usageDays = $('#usageDays');
+    if (usageDays) usageDays.addEventListener('change', fetchUsage);
     $('#btnAddRule').addEventListener('click', () => {
         state.routeRows.push({ key: '', candidates: '' });
         renderRouteTable();
@@ -783,6 +938,7 @@ function bindEvents() {
 
     window.addEventListener('resize', () => {
         if (state.view === 'dashboard') drawChart();
+        else if (state.view === 'usage') drawUsageChart();
     });
 
     document.addEventListener('visibilitychange', () => {
@@ -804,6 +960,11 @@ function startPolling() {
     _timers.push(setInterval(fetchStatus, 1000));
     _timers.push(setInterval(fetchMetrics, 1000));
     _timers.push(setInterval(fetchLogs, 1000));
+    // 报表页数据量大，低频轮询且仅在对应视图激活时拉取
+    _timers.push(setInterval(() => {
+        if (state.view === 'proxies') fetchProxies();
+        else if (state.view === 'usage') fetchUsage();
+    }, 3000));
 }
 function stopPolling() {
     _timers.forEach(clearInterval);

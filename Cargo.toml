@@ -18,6 +18,7 @@ bytes = "1.5"
 tokio-stream = "0.1"
 dashmap = "5"
 hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 regex = "1"

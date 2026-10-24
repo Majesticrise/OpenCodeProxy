@@ -74,6 +74,27 @@ pub static METRICS_FILE: LazyLock<String> = LazyLock::new(|| {
     env::var("METRICS_FILE").unwrap_or_else(|_| "metrics_totals.json".to_string())
 });
 
+/// SQLite 数据库路径（代理信誉 + 请求明细）。空串 = 禁用数据库。
+pub static ZEN_DB: LazyLock<String> =
+    LazyLock::new(|| env::var("ZEN_DB").unwrap_or_else(|_| "zen.db".to_string()));
+
+/// requests 明细保留天数（默认 90，0 = 永久保留）。
+pub static REQUEST_LOG_DAYS: LazyLock<i64> = LazyLock::new(|| {
+    env::var("REQUEST_LOG_DAYS")
+        .unwrap_or_else(|_| "90".to_string())
+        .parse()
+        .unwrap_or(90)
+});
+
+/// 可选的 proxycheck.io 免费 key（注册后每天 1000 次查询，附带 IP risk 评分）。
+/// 不设置时只用 ip-api.com（无 key、批量、无评分）。
+pub static PROXYCHECK_KEY: LazyLock<Option<String>> = LazyLock::new(|| {
+    env::var("PROXYCHECK_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+});
+
 pub static PERSIST_METRICS: LazyLock<bool> = LazyLock::new(|| {
     env::var("PERSIST_METRICS")
         .map(|v| v != "false" && v != "0")

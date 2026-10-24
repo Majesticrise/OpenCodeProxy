@@ -1,6 +1,8 @@
 use crate::config::{MIN_POOL_SIZE, VALIDATE_TARGET};
+use crate::db::{extract_ip, now_secs, Db, IpInfo};
 use futures_util::stream::{self, StreamExt};
 use rand::seq::SliceRandom;
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -39,10 +41,17 @@ pub struct ProxyEntry {
     pub last_success: Option<Instant>,
     /// 累计请求成功次数。优先复用该值高的代理，避免每次盲选反复重试。
     pub success_count: u32,
+    /// 累计被上游风控（403 FreeTier）次数。
+    pub ban_count: u32,
+    /// IP 情报（国家/ISP/ASN/使用场景/风险评分/是否机房），iplark 类信息。
+    pub info: IpInfo,
+    pub first_seen: i64,
+    pub last_used: i64,
 }
 
 impl ProxyEntry {
     fn new(url: String, latency: f64) -> Self {
+        let now = now_secs();
         Self {
             url,
             latency,
@@ -50,6 +59,10 @@ impl ProxyEntry {
             fail_count: 0,
             last_success: None,
             success_count: 0,
+            ban_count: 0,
+            info: IpInfo::default(),
+            first_seen: now,
+            last_used: 0,
         }
     }
 
@@ -58,7 +71,7 @@ impl ProxyEntry {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     RateLimit,
     Connection,
@@ -90,6 +103,15 @@ impl FailureKind {
             FailureKind::Banned => "banned",
         }
     }
+
+    /// 数据库 record_outcome 的 kind 参数。
+    fn db_kind(self) -> &'static str {
+        match self {
+            FailureKind::RateLimit => "rate_limit",
+            FailureKind::Connection => "fail",
+            FailureKind::Banned => "ban",
+        }
+    }
 }
 
 pub struct ProxyPoolInner {
@@ -103,6 +125,8 @@ pub struct ProxyPoolInner {
 pub struct ProxyPool {
     pub inner: Arc<RwLock<ProxyPoolInner>>,
     pub is_fetching: Arc<AtomicBool>,
+    /// SQLite 层：信誉跨重启持久化 + IP 情报。禁用时内部方法全部 no-op。
+    pub db: Arc<Db>,
 }
 
 struct FetchingReset(Arc<AtomicBool>);
@@ -113,7 +137,7 @@ impl Drop for FetchingReset {
 }
 
 impl ProxyPool {
-    pub fn new(file_path: &str) -> Self {
+    pub fn new(file_path: &str, db: Arc<Db>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(ProxyPoolInner {
                 proxies: Vec::new(),
@@ -122,6 +146,7 @@ impl ProxyPool {
                 total_requests: AtomicU64::new(0),
             })),
             is_fetching: Arc::new(AtomicBool::new(false)),
+            db,
         }
     }
 
@@ -147,6 +172,9 @@ impl ProxyPool {
                     file_proxies.push(ProxyEntry::new(proxy_url, 0.0));
                 }
                 if !file_proxies.is_empty() {
+                    for p in &file_proxies {
+                        self.db.upsert_proxy(&p.url, p.latency, "file");
+                    }
                     let mut inner = self.inner.write().await;
                     let n = file_proxies.len();
                     inner.proxies = file_proxies;
@@ -156,6 +184,46 @@ impl ProxyPool {
             }
         }
 
+        // ── 数据库恢复：信誉/冷却/IP 情报跨重启保留 ──
+        // 首次运行时顺带把旧版 verified_proxies.json 导入数据库。
+        self.db.import_legacy_verified("verified_proxies.json");
+        let rows = self.db.load_active_proxies();
+        if !rows.is_empty() {
+            let now_unix = now_secs();
+            let now_inst = Instant::now();
+            let entries: Vec<ProxyEntry> = rows
+                .into_iter()
+                .map(|r| ProxyEntry {
+                    url: r.url,
+                    latency: r.latency,
+                    cooldown_until: if r.cooldown_until_unix > now_unix {
+                        Some(
+                            now_inst
+                                + Duration::from_secs((r.cooldown_until_unix - now_unix) as u64),
+                        )
+                    } else {
+                        None
+                    },
+                    fail_count: r.fail_count,
+                    last_success: None,
+                    success_count: r.success_count,
+                    ban_count: r.ban_count,
+                    info: r.info,
+                    first_seen: 0, // DB 行有值但此处无需回填
+                    last_used: r.last_used,
+                })
+                .collect();
+            let n = entries.len();
+            let mut inner = self.inner.write().await;
+            inner.proxies = entries;
+            info!(
+                "Restored {} proxies from database (with reputation & IP intel)",
+                n
+            );
+            return;
+        }
+
+        // ── 旧版 verified_proxies.json（数据库禁用时的兜底） ──
         if let Ok(content) = tokio::fs::read_to_string("verified_proxies.json").await {
             if let Ok(validated) = serde_json::from_str::<Vec<(String, f64)>>(&content) {
                 if !validated.is_empty() {
@@ -359,6 +427,9 @@ impl ProxyPool {
         }
 
         self.persist_verified_proxies().await;
+
+        // 验证完成后补一轮 IP 情报富化（国家 / ISP / 评分），失败不影响池子
+        self.enrich_pending().await;
     }
 
     async fn flush_validation_batch(
@@ -370,35 +441,42 @@ impl ProxyPool {
             return 0;
         }
         let count = batch.len();
+        let for_db: Vec<(String, f64)> = batch.clone();
 
-        let mut inner = self.inner.write().await;
-        for (url, lat) in batch.drain(..) {
-            let entry = match existing.get(&url).cloned() {
-                Some(mut old) => {
-                    old.latency = lat;
-                    old
+        {
+            let mut inner = self.inner.write().await;
+            for (url, lat) in batch.drain(..) {
+                let entry = match existing.get(&url).cloned() {
+                    Some(mut old) => {
+                        old.latency = lat;
+                        old
+                    }
+                    None => ProxyEntry::new(url, lat),
+                };
+
+                if let Some(pos) = inner.proxies.iter().position(|p| p.url == entry.url) {
+                    inner.proxies[pos] = entry;
+                } else {
+                    inner.proxies.push(entry);
                 }
-                None => ProxyEntry::new(url, lat),
-            };
+            }
 
-            if let Some(pos) = inner.proxies.iter().position(|p| p.url == entry.url) {
-                inner.proxies[pos] = entry;
-            } else {
-                inner.proxies.push(entry);
+            // 未测速（latency <= 0，如刚从 proxies.txt 加载）排在已测速节点之前，
+            // 防止它们被下面的 MAX_POOL_SIZE 截断掉；冷启动选择见 get_proxy（优先已测速）。
+            inner.proxies.sort_by(|a, b| {
+                let la = if a.latency <= 0.0 { -1.0 } else { a.latency };
+                let lb = if b.latency <= 0.0 { -1.0 } else { b.latency };
+                la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if inner.proxies.len() > MAX_POOL_SIZE {
+                inner.proxies.truncate(MAX_POOL_SIZE);
             }
         }
 
-        // 未测速（latency <= 0，如刚从 proxies.txt 加载）排在已测速节点之前，
-        // 防止它们被下面的 MAX_POOL_SIZE 截断掉；冷启动选择见 get_proxy（优先已测速）。
-        inner.proxies.sort_by(|a, b| {
-            let la = if a.latency <= 0.0 { -1.0 } else { a.latency };
-            let lb = if b.latency <= 0.0 { -1.0 } else { b.latency };
-            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if inner.proxies.len() > MAX_POOL_SIZE {
-            inner.proxies.truncate(MAX_POOL_SIZE);
+        // 池锁释放后再落库（同步短操作，避免占着池写锁做 IO）
+        for (url, lat) in &for_db {
+            self.db.upsert_proxy(url, *lat, "fetch");
         }
-
         count
     }
 
@@ -462,18 +540,27 @@ impl ProxyPool {
             return proven.choose(&mut rng).map(|p| p.url.clone());
         }
 
-        // 冷启动盲选：优先在「已测速」（latency > 0，验证时实测过）的节点里挑最快的
-        // 若干个；全池都没有测速数据（例如刚从 proxies.txt 加载）时才退回原始顺序。
-        let measured: Vec<&ProxyEntry> = available
-            .iter()
-            .copied()
-            .filter(|p| p.latency > 0.0)
-            .collect();
-        let cold: &[&ProxyEntry] = if measured.is_empty() {
-            &available
-        } else {
-            &measured
+        // 冷启动盲选：优先在「已测速」（latency > 0，验证时实测过）的节点里挑。
+        // 排序键 = 实测延迟 + 风险惩罚（proxycheck risk 每 1 分折 0.01s，
+        // 未查询按中性 0.5s 计），让低风险节点优先获得真实流量。
+        let mut cold: Vec<&ProxyEntry> = {
+            let measured: Vec<&ProxyEntry> = available
+                .iter()
+                .copied()
+                .filter(|p| p.latency > 0.0)
+                .collect();
+            if measured.is_empty() {
+                available
+            } else {
+                measured
+            }
         };
+        let risk_penalty = |p: &ProxyEntry| p.info.risk.map(|r| r as f64 * 0.01).unwrap_or(0.5);
+        cold.sort_by(|a, b| {
+            let ka = a.latency + risk_penalty(a);
+            let kb = b.latency + risk_penalty(b);
+            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let limit = std::cmp::min(15, cold.len());
         cold[..limit].choose(&mut rng).map(|p| p.url.clone())
     }
@@ -520,7 +607,10 @@ impl ProxyPool {
             entry.cooldown_until = None;
             entry.success_count = entry.success_count.saturating_add(1);
             entry.last_success = Some(Instant::now());
+            entry.last_used = now_secs();
         }
+        drop(inner);
+        self.db.record_outcome(proxy_url, "success", None);
     }
 
     async fn report_kind(&self, proxy_url: &str, kind: FailureKind) {
@@ -528,7 +618,7 @@ impl ProxyPool {
         let max_fails = kind.max_fails_before_removal();
         let label = kind.label();
 
-        let (after_len, fetching) = {
+        let (after_len, fetching, should_remove) = {
             let mut inner = self.inner.write().await;
             let now = Instant::now();
 
@@ -537,6 +627,10 @@ impl ProxyPool {
                 if max_fails.is_some() {
                     entry.fail_count += 1;
                 }
+                if kind == FailureKind::Banned {
+                    entry.ban_count = entry.ban_count.saturating_add(1);
+                }
+                entry.last_used = now_secs();
                 entry.cooldown_until = Some(now + cooldown);
                 should_remove = max_fails
                     .map(|max| entry.fail_count >= max)
@@ -562,8 +656,19 @@ impl ProxyPool {
             (
                 inner.proxies.len(),
                 self.is_fetching.load(Ordering::Relaxed),
+                should_remove,
             )
         };
+
+        // 池锁释放后回写数据库
+        if should_remove {
+            self.db.mark_removed(proxy_url);
+        } else {
+            let cooldown_until_unix =
+                now_secs() + cooldown.as_secs() as i64;
+            self.db
+                .record_outcome(proxy_url, kind.db_kind(), Some(cooldown_until_unix));
+        }
 
         if after_len < *MIN_POOL_SIZE && !fetching {
             let self_clone = self.clone();
@@ -571,5 +676,287 @@ impl ProxyPool {
                 self_clone.fetch_free_proxies().await;
             });
         }
+    }
+
+    /// 对池内缺少 IP 情报的代理做批量富化（iplark 同类信息，走免费 API）：
+    /// 1) ip-api.com 批量接口（免费无 key，100 IP/请求，约 15 请求/分钟）：
+    ///    国家 / ISP / ASN / 是否机房 IP
+    /// 2) 可选 proxycheck.io（配置 PROXYCHECK_KEY，免费注册 1000 次/天）：风险评分 + 使用场景
+    pub async fn enrich_pending(&self) {
+        let pending: Vec<String> = {
+            let inner = self.inner.read().await;
+            inner
+                .proxies
+                .iter()
+                .filter(|p| p.info.country.is_none() && p.info.risk.is_none())
+                .map(|p| p.url.clone())
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        info!(
+            "Enriching IP intel for {} proxies (ip-api.com batch)...",
+            pending.len()
+        );
+
+        let Ok(client) = wreq::Client::builder()
+            .emulation(impersonate())
+            .timeout(Duration::from_secs(20))
+            .build()
+        else {
+            return;
+        };
+
+        for chunk in pending.chunks(100) {
+            let ips: Vec<String> = chunk.iter().filter_map(|u| extract_ip(u)).collect();
+            if ips.is_empty() {
+                continue;
+            }
+            let url = "http://ip-api.com/batch?fields=status,query,country,countryCode,isp,as,hosting";
+            match client.post(url).json(&ips).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(v) = resp.json::<Value>().await {
+                        let intel = parse_ipapi_batch(&v);
+                        self.apply_intel(chunk, intel).await;
+                    }
+                }
+                Ok(resp) => {
+                    warn!(
+                        "ip-api batch returned {}; skipping rest of this round",
+                        resp.status()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    warn!("ip-api batch failed: {}; skipping rest of this round", e);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await; // 限速：约 12 批/分钟
+        }
+
+        if let Some(key) = crate::config::PROXYCHECK_KEY.as_ref() {
+            self.proxycheck_pass(&client, key).await;
+        }
+    }
+
+    /// 把批量查询结果合并进池内存条目并落库（只覆盖查询到的新字段）。
+    async fn apply_intel(&self, urls: &[String], intel: HashMap<String, IpInfo>) {
+        if intel.is_empty() {
+            return;
+        }
+        let mut merged: Vec<(String, IpInfo)> = Vec::new();
+        {
+            let mut inner = self.inner.write().await;
+            for url in urls {
+                let Some(ip) = extract_ip(url) else { continue };
+                let Some(new_info) = intel.get(&ip) else { continue };
+                if let Some(entry) = inner.proxies.iter_mut().find(|p| p.url == *url) {
+                    merge_info(&mut entry.info, new_info);
+                    merged.push((url.clone(), entry.info.clone()));
+                }
+            }
+        }
+        for (url, info) in &merged {
+            self.db.enrich_proxy(url, info);
+        }
+        if !merged.is_empty() {
+            debug!("IP intel merged for {} proxies", merged.len());
+        }
+    }
+
+    /// proxycheck.io 逐个查询风险评分与使用场景（配置 PROXYCHECK_KEY 时启用）。
+    async fn proxycheck_pass(&self, client: &wreq::Client, key: &str) {
+        let need: Vec<String> = {
+            let inner = self.inner.read().await;
+            inner
+                .proxies
+                .iter()
+                .filter(|p| p.info.risk.is_none())
+                .map(|p| p.url.clone())
+                .collect()
+        };
+        if need.is_empty() {
+            return;
+        }
+        // 免费额度 1000 次/天，池子上限 120，余量充足
+        info!(
+            "Querying proxycheck.io risk score for {} proxies (free tier: 1000/day)",
+            need.len()
+        );
+        for url in &need {
+            let Some(ip) = extract_ip(url) else { continue };
+            let api = format!("https://proxycheck.io/v2/{}?key={}&vpn=1&risk=1", ip, key);
+            match client.get(&api).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(v) = resp.json::<Value>().await {
+                        if let Some(patch) = parse_proxycheck(&v, &ip) {
+                            let mut m = HashMap::new();
+                            m.insert(ip.clone(), patch);
+                            self.apply_intel(std::slice::from_ref(url), m).await;
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(
+                        "proxycheck returned {} for {}; stopping risk pass",
+                        resp.status(),
+                        ip
+                    );
+                    break;
+                }
+                Err(e) => {
+                    warn!("proxycheck query failed: {}; stopping risk pass", e);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await; // 限速
+        }
+    }
+}
+
+/// 把新查到的字段合并进已有情报（只覆盖 Some 字段，None 不动）。
+fn merge_info(base: &mut IpInfo, patch: &IpInfo) {
+    if patch.country.is_some() {
+        base.country = patch.country.clone();
+    }
+    if patch.country_code.is_some() {
+        base.country_code = patch.country_code.clone();
+    }
+    if patch.isp.is_some() {
+        base.isp = patch.isp.clone();
+    }
+    if patch.asn.is_some() {
+        base.asn = patch.asn.clone();
+    }
+    if patch.ip_type.is_some() {
+        base.ip_type = patch.ip_type.clone();
+    }
+    if patch.risk.is_some() {
+        base.risk = patch.risk;
+    }
+    if patch.hosting.is_some() {
+        base.hosting = patch.hosting;
+    }
+}
+
+fn str_field(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(String::from)
+}
+
+/// 解析 ip-api.com /batch 响应：`[{query, country, countryCode, isp, as, hosting}, ...]`
+fn parse_ipapi_batch(v: &Value) -> HashMap<String, IpInfo> {
+    let mut out = HashMap::new();
+    let Some(arr) = v.as_array() else {
+        return out;
+    };
+    for item in arr {
+        if str_field(item, "status").as_deref() != Some("success") {
+            continue;
+        }
+        let Some(ip) = str_field(item, "query") else {
+            continue;
+        };
+        out.insert(
+            ip,
+            IpInfo {
+                country: str_field(item, "country"),
+                country_code: str_field(item, "countryCode"),
+                isp: str_field(item, "isp"),
+                asn: str_field(item, "as"),
+                ip_type: None,
+                risk: None,
+                hosting: item.get("hosting").and_then(|h| h.as_bool()),
+            },
+        );
+    }
+    out
+}
+
+/// 解析 proxycheck.io v2 响应：`{"status":"ok","<ip>":{"proxy":"yes","type":"SOCKS5","risk":"92"}}`
+/// risk 兼容字符串和数字两种形式。
+fn parse_proxycheck(v: &Value, ip: &str) -> Option<IpInfo> {
+    if v.get("status").and_then(|s| s.as_str()) != Some("ok") {
+        return None;
+    }
+    let entry = v.get(ip)?;
+    let risk = str_field(entry, "risk")
+        .and_then(|r| r.parse::<u32>().ok())
+        .or_else(|| entry.get("risk").and_then(|r| r.as_u64()).map(|r| r as u32));
+    Some(IpInfo {
+        country: None,
+        country_code: None,
+        isp: None,
+        asn: None,
+        ip_type: str_field(entry, "type"),
+        risk,
+        hosting: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_ipapi_batch_ok_and_failed_rows() {
+        let v = json!([
+            {"status":"success","query":"1.2.3.4","country":"China","countryCode":"CN",
+             "isp":"China Mobile","as":"AS9808 China Mobile","hosting":false},
+            {"status":"fail","query":"5.6.7.8"}
+        ]);
+        let m = parse_ipapi_batch(&v);
+        assert_eq!(m.len(), 1, "失败行应被跳过");
+        let info = &m["1.2.3.4"];
+        assert_eq!(info.country_code.as_deref(), Some("CN"));
+        assert_eq!(info.isp.as_deref(), Some("China Mobile"));
+        assert_eq!(info.hosting, Some(false));
+        assert!(info.risk.is_none());
+    }
+
+    #[test]
+    fn parse_proxycheck_variants() {
+        // risk 字符串形式
+        let v = json!({"status":"ok","223.73.113.115":{"proxy":"no","type":"Wireless","risk":"0"}});
+        let info = parse_proxycheck(&v, "223.73.113.115").unwrap();
+        assert_eq!(info.risk, Some(0));
+        assert_eq!(info.ip_type.as_deref(), Some("Wireless"));
+
+        // risk 数字形式
+        let v2 = json!({"status":"ok","1.1.1.1":{"proxy":"yes","type":"SOCKS5","risk":92}});
+        assert_eq!(parse_proxycheck(&v2, "1.1.1.1").unwrap().risk, Some(92));
+
+        // 状态非 ok / IP 不存在
+        assert!(parse_proxycheck(&json!({"status":"error"}), "1.1.1.1").is_none());
+        assert!(parse_proxycheck(&json!({"status":"ok"}), "2.2.2.2").is_none());
+    }
+
+    #[test]
+    fn merge_info_only_fills_some_fields() {
+        let mut base = IpInfo {
+            country: Some("China".into()),
+            country_code: Some("CN".into()),
+            isp: None,
+            asn: None,
+            ip_type: None,
+            risk: None,
+            hosting: Some(false),
+        };
+        let patch = IpInfo {
+            country: None,
+            country_code: None,
+            isp: Some("ISP X".into()),
+            asn: None,
+            ip_type: Some("Wireless".into()),
+            risk: Some(30),
+            hosting: Some(true),
+        };
+        merge_info(&mut base, &patch);
+        assert_eq!(base.country.as_deref(), Some("China"), "None 字段不应覆盖");
+        assert_eq!(base.isp.as_deref(), Some("ISP X"));
+        assert_eq!(base.risk, Some(30));
+        assert_eq!(base.hosting, Some(true));
     }
 }

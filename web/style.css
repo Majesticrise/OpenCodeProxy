@@ -703,3 +703,23 @@ select:focus { border-color: var(--accent); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+/* ── 代理详情 / 用量报表 ── */
+.mono {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+}
+.dim-text {
+    color: #7d8794;
+    font-size: 12px;
+}
+.ok-text { color: #58c48c; }
+.warn-text { color: #e0a84e; }
+.err-text { color: #e06a5a; }
+#usageDays {
+    background: #1a1f29;
+    color: #dce3ec;
+    border: 1px solid #2f3643;
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-size: 13px;
+}

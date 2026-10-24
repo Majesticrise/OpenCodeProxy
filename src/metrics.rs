@@ -55,32 +55,56 @@ pub struct RequestMetric {
     pub usage: Option<UsageInfo>,
 }
 
+/// 单条请求的元数据，随 TrackerState 传递，落库时作为 requests 表的列。
+pub struct TrackerMeta {
+    /// 客户端请求的模型名。
+    pub model: String,
+    /// 实际发给上游的模型名（可能被 fallback 改写）。
+    pub model_used: String,
+    /// 本次请求最终使用的代理（None = 直连）。
+    pub proxy_url: Option<String>,
+    /// "anonymous" / "authenticated"。
+    pub mode: String,
+    pub session_id: String,
+}
+
 pub struct TrackerState {
     pub start: Instant,
     pub model: String,
+    pub model_used: String,
+    pub proxy_url: Option<String>,
+    pub mode: String,
+    pub session_id: String,
     pub is_stream: bool,
     pub status: u16,
     pub usage: Mutex<Option<UsageInfo>>,
     pub estimated_prompt_tokens: u64,
     pub streamed_chars: AtomicU64,
+    /// 首字节延迟（流式：上游第一个 chunk 的到达时间），0 = 未知。
+    pub ttft_ms: AtomicU64,
 }
 
 impl TrackerState {
     pub fn new(
         start: Instant,
-        model: String,
         is_stream: bool,
         status: u16,
         estimated_prompt_tokens: u64,
+        meta: TrackerMeta,
     ) -> Self {
         Self {
             start,
-            model,
+            model: meta.model,
+            model_used: meta.model_used,
+            proxy_url: meta.proxy_url,
+            mode: meta.mode,
+            session_id: meta.session_id,
             is_stream,
             status,
             usage: Mutex::new(None),
             estimated_prompt_tokens,
             streamed_chars: AtomicU64::new(0),
+            ttft_ms: AtomicU64::new(0),
         }
     }
 }
@@ -459,6 +483,8 @@ pub fn try_extract_usage_from_chunk(chunk: &[u8], buf: &mut Vec<u8>) -> Option<U
 pub struct MetricsGuard {
     pub metrics: Arc<MetricsStore>,
     pub tracker: Arc<TrackerState>,
+    /// SQLite 层，请求明细落库（禁用 / PERSIST_METRICS=false 时内部 no-op）。
+    pub db: Option<Arc<crate::db::Db>>,
 }
 
 impl Drop for MetricsGuard {
@@ -496,14 +522,47 @@ impl Drop for MetricsGuard {
             is_real,
         );
 
+        let latency_ms = self.tracker.start.elapsed().as_millis() as u64;
+
+        // 先构造 DB 记录（借用 usage），再把 usage 克隆进内存指标并写入
+        let db_rec = if self.db.is_some() {
+            let u = usage.as_ref();
+            Some(crate::db::RequestRecord {
+                ts: now_secs() as i64,
+                mode: self.tracker.mode.clone(),
+                model: self.tracker.model.clone(),
+                model_used: self.tracker.model_used.clone(),
+                status: self.tracker.status,
+                latency_ms,
+                ttft_ms: self.tracker.ttft_ms.load(Ordering::Relaxed),
+                is_stream: self.tracker.is_stream,
+                proxy_url: self.tracker.proxy_url.clone(),
+                session_id: self.tracker.session_id.clone(),
+                prompt_tokens: u.map(|x| x.prompt_tokens).unwrap_or(0),
+                completion_tokens: u.map(|x| x.completion_tokens).unwrap_or(0),
+                total_tokens: u.map(|x| x.total_tokens).unwrap_or(0),
+                cached_tokens: u.map(|x| x.cached_tokens).unwrap_or(0),
+                reasoning_tokens: u.map(|x| x.reasoning_tokens).unwrap_or(0),
+                real_usage: is_real,
+            })
+        } else {
+            None
+        };
+
         let metric = RequestMetric {
             timestamp_secs: now_secs(),
-            latency_ms: self.tracker.start.elapsed().as_millis() as u64,
+            latency_ms,
             status: self.tracker.status,
             model: self.tracker.model.clone(),
             usage,
         };
         self.metrics.record(metric);
+
+        // 请求明细写入 SQLite（含 token 计量 / TTFT / 代理归属）
+        if let (Some(db), Some(rec)) = (&self.db, db_rec) {
+            db.record_request(&rec);
+        }
+
         self.metrics
             .active_requests
             .fetch_sub(1, Ordering::Relaxed);

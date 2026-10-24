@@ -1,4 +1,5 @@
 mod config;
+mod db;
 mod handlers;
 mod logger;
 mod metrics;
@@ -50,11 +51,24 @@ async fn main() {
     info!("Zen Proxy (Rust version v1.2.6 - WebUI Integrated)");
     info!("============================================================");
 
+    // ── SQLite（代理信誉 + 请求明细；ZEN_DB 为空串时禁用） ──
+    let db = Arc::new(db::Db::open(&config::ZEN_DB));
+    db.prune_requests(*config::REQUEST_LOG_DAYS);
+    let db_prune = db.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(86400)).await;
+            db_prune.prune_requests(*config::REQUEST_LOG_DAYS);
+        }
+    });
+
     // ── 代理池 ──
-    let proxy_pool = ProxyPool::new(&config::PROXY_FILE);
+    let proxy_pool = ProxyPool::new(&config::PROXY_FILE, db.clone());
     let pool_clone = proxy_pool.clone();
     tokio::spawn(async move {
         pool_clone.load_proxies().await;
+        // 从数据库恢复的代理若缺 IP 情报（如旧数据导入），启动后补一轮富化
+        pool_clone.enrich_pending().await;
     });
 
     let pool_refresh = proxy_pool.clone();
@@ -111,6 +125,7 @@ async fn main() {
         pool: proxy_pool,
         log_buffer: log_buffer.clone(),
         metrics,
+        db,
         client_cache: Arc::new(DashMap::new()),
         routing: Arc::new(RwLock::new(routing)),
         upstream_models: Arc::new(RwLock::new(Default::default())),
@@ -132,6 +147,9 @@ async fn main() {
         )
         .route("/api/upstream/models", get(handlers::api_upstream_models))
         .route("/api/upstream/refresh", post(handlers::api_upstream_refresh))
+        // 数据库报表
+        .route("/api/proxies", get(handlers::api_proxies))
+        .route("/api/usage", get(handlers::api_usage))
         // 运行时设置
         .route("/api/settings", get(handlers::api_get_settings))
         .route("/api/settings/mode", post(handlers::api_set_mode))

@@ -1,5 +1,6 @@
 use crate::{
     config::RoutingConfig,
+    db::Db,
     logger::LogBuffer,
     metrics::MetricsStore,
     proxy::ProxyPool,
@@ -25,6 +26,8 @@ pub struct AppState {
     pub pool: ProxyPool,
     pub log_buffer: Arc<LogBuffer>,
     pub metrics: Arc<MetricsStore>,
+    /// SQLite 层（代理信誉 + 请求明细）。禁用时内部方法全部 no-op。
+    pub db: Arc<Db>,
     pub client_cache: Arc<DashMap<Option<String>, wreq::Client>>,
     pub routing: Arc<RwLock<RoutingConfig>>,
     pub upstream_models: Arc<RwLock<UpstreamCache>>,

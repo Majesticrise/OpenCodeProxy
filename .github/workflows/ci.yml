@@ -124,6 +124,16 @@ jobs:
           curl -fsS http://127.0.0.1:8910/api/metrics | tee /tmp/metrics.json
           jq -e '.total_requests >= 1' /tmp/metrics.json
 
+      - name: DB-backed endpoints
+        run: |
+          # 代理详情 / 用量报表端点（SQLite 层）
+          curl -fsS http://127.0.0.1:8910/api/proxies | tee /tmp/proxies.json
+          jq -e '(.proxies | type) == "array"' /tmp/proxies.json
+
+          curl -fsS "http://127.0.0.1:8910/api/usage?days=7" | tee /tmp/usage.json
+          jq -e '(.daily | type) == "array"' /tmp/usage.json
+          jq -e '(.models | type) == "array"' /tmp/usage.json
+
       - name: Cleanup
         if: always()
         run: kill $(cat /tmp/gw.pid) 2>/dev/null || true

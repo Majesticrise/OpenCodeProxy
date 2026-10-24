@@ -347,11 +347,11 @@ fn force_stream_options(body: &mut serde_json::Value) {
 fn tracked_error_response(
     state: &AppState,
     request_start: Instant,
-    model: &str,
     status: u16,
     estimated_prompt: u64,
     content_type: &'static str,
     body: impl Into<bytes::Bytes>,
+    meta: crate::metrics::TrackerMeta,
 ) -> Response {
     use crate::metrics::{MetricsGuard, TrackerState};
 
@@ -361,10 +361,10 @@ fn tracked_error_response(
         .fetch_add(1, Ordering::Relaxed);
     let tracker = Arc::new(TrackerState::new(
         request_start,
-        model.to_string(),
         false,
         status,
         estimated_prompt,
+        meta,
     ));
     let mut response = Response::new(Body::from(body.into()));
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -377,6 +377,7 @@ fn tracked_error_response(
         .insert(Arc::new(MetricsGuard {
             metrics: state.metrics.clone(),
             tracker,
+            db: Some(state.db.clone()),
         }));
     response
 }
@@ -505,7 +506,14 @@ pub async fn chat_completions(
 
     let estimated_prompt = estimate_prompt_tokens(&forward_body);
 
-    let model_for_metrics = requested_model.clone();
+    // 落库元数据：model_used / proxy_url 在拿到最终响应后回填
+    let mut meta = crate::metrics::TrackerMeta {
+        model: requested_model.clone(),
+        model_used: requested_model.clone(),
+        proxy_url: None,
+        mode: if is_authenticated { "authenticated" } else { "anonymous" }.to_string(),
+        session_id: session_id.clone(),
+    };
     let max_retries = 8usize;
     let mut target_resp: Option<wreq::Response> = None;
     let mut last_proxy: Option<String> = None;
@@ -636,6 +644,7 @@ pub async fn chat_completions(
                             &new_session[..new_session.len().min(12)]
                         );
                         session_id = new_session;
+                        meta.session_id = session_id.clone();
                     }
                     tokio::time::sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
                     continue;
@@ -678,11 +687,11 @@ pub async fn chat_completions(
                         return tracked_error_response(
                             &state,
                             request_start,
-                            &model_for_metrics,
                             code,
                             estimated_prompt,
                             "application/json",
                             body_bytes,
+                            meta.clone(),
                         );
                     }
 
@@ -707,11 +716,11 @@ pub async fn chat_completions(
                 return tracked_error_response(
                     &state,
                     request_start,
-                    &model_for_metrics,
                     code,
                     estimated_prompt,
                     "application/json",
                     body_bytes,
+                    meta.clone(),
                 );
             }
         }
@@ -732,11 +741,11 @@ pub async fn chat_completions(
                     return tracked_error_response(
                         &state,
                         request_start,
-                        &model_for_metrics,
                         500,
                         estimated_prompt,
                         "text/plain; charset=utf-8",
                         format!("Failed to create direct client: {}", e),
+                        meta.clone(),
                     )
                 }
             };
@@ -790,11 +799,11 @@ pub async fn chat_completions(
                         return tracked_error_response(
                             &state,
                             request_start,
-                            &model_for_metrics,
                             status_code,
                             estimated_prompt,
                             "application/json",
                             body,
+                            meta.clone(),
                         );
                     }
 
@@ -813,16 +822,25 @@ pub async fn chat_completions(
                     return tracked_error_response(
                         &state,
                         request_start,
-                        &model_for_metrics,
                         502,
                         estimated_prompt,
                         "text/plain; charset=utf-8",
                         format!("Upstream direct connection failed: {}", e),
+                        meta.clone(),
                     );
                 }
             }
         }
     };
+
+    // 回填落库元数据：实际使用的模型 / 代理 /（可能已轮换的）session
+    meta.model_used = forward_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(&requested_model)
+        .to_string();
+    meta.proxy_url = last_proxy.clone();
+    meta.session_id = session_id.clone();
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut headers = HeaderMap::new();
@@ -855,11 +873,11 @@ pub async fn chat_completions(
                 return tracked_error_response(
                     &state,
                     request_start,
-                    &model_for_metrics,
                     502,
                     estimated_prompt,
                     "text/plain; charset=utf-8",
                     format!("aggregate failed: {e}"),
+                    meta.clone(),
                 )
             }
         };
@@ -871,10 +889,10 @@ pub async fn chat_completions(
 
         let tracker = Arc::new(TrackerState::new(
             request_start,
-            model_for_metrics,
             false,
             status.as_u16(),
             estimated_prompt,
+            meta.clone(),
         ));
         if let Some(u) = usage {
             *tracker.usage.lock().unwrap() = Some(u);
@@ -893,6 +911,7 @@ pub async fn chat_completions(
         response.extensions_mut().insert(Arc::new(MetricsGuard {
             metrics: state.metrics.clone(),
             tracker,
+            db: Some(state.db.clone()),
         }));
         return response;
     }
@@ -908,10 +927,10 @@ pub async fn chat_completions(
 
     let tracker = Arc::new(TrackerState::new(
         request_start,
-        model_for_metrics,
         true,
         status.as_u16(),
         estimated_prompt,
+        meta.clone(),
     ));
 
     let usage_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -936,6 +955,13 @@ pub async fn chat_completions(
 
             match inner.next().await {
                 Some(Ok(chunk)) => {
+                    // 首字节延迟（TTFT）：上游第一个 chunk 的到达时刻，只记一次
+                    if tracker.ttft_ms.load(Ordering::Relaxed) == 0 {
+                        tracker.ttft_ms.store(
+                            tracker.start.elapsed().as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
                     {
                         let mut b = buf.lock().unwrap();
                         if let Some(u) = try_extract_usage_from_chunk(&chunk[..], &mut b) {
@@ -1015,6 +1041,7 @@ pub async fn chat_completions(
     response.extensions_mut().insert(Arc::new(MetricsGuard {
         metrics: state.metrics.clone(),
         tracker,
+        db: Some(state.db.clone()),
     }));
     response
 }
