@@ -770,7 +770,8 @@ async function loadModels() {
     }
 
     if (allModels.length === 0) {
-        allModels = ['big-pickle', 'mimo-v2.6-flash-free'];
+        // 应急兜底：单一来源是 src/config.rs 的 DEFAULT_MODELS，后端正常时永远从 API 获取
+        allModels = ['deepseek-v4-flash-free', 'big-pickle'];
     }
 
     const seen = new Set();

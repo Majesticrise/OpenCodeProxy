@@ -177,3 +177,29 @@ impl RoutingConfig {
         Self::from_env()
     }
 }
+
+/// 无路由配置时 `/v1/models` 的兜底模型列表（单一来源）：
+/// - `handlers/models.rs` 据此生成模型列表（元组第二项为 owned_by 厂商）
+/// - `handlers/forward.rs` 在客户端未传 `model` 字段时默认取第一项
+/// - `web/app.js` 的前端应急兜底需与此保持一致（后端正常时前端永远从 API 获取）
+pub const DEFAULT_MODELS: &[(&str, &str)] = &[
+    ("deepseek-v4-flash-free", "deepseek"),
+    ("big-pickle", "opencode"),
+    ("mimo-v2.5-free", "xiaomi"),
+    ("nemotron-3-super-free", "nvidia"),
+    ("minimax-m3-free", "minimax"),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_models_nonempty_and_unique() {
+        assert!(!DEFAULT_MODELS.is_empty(), "默认模型列表不能为空");
+        let mut seen = std::collections::HashSet::new();
+        for (id, _) in DEFAULT_MODELS {
+            assert!(seen.insert(*id), "默认模型重复: {}", id);
+        }
+    }
+}

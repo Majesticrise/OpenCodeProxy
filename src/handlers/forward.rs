@@ -429,7 +429,7 @@ pub async fn chat_completions(
     let requested_model = body_json
         .get("model")
         .and_then(|m| m.as_str())
-        .unwrap_or("deepseek-v4-flash-free")
+        .unwrap_or(DEFAULT_MODELS[0].0)
         .to_string();
     let downstream_stream = body_json
         .get("stream")

@@ -1,4 +1,4 @@
-use crate::state::AppState;
+use crate::{config::DEFAULT_MODELS, state::AppState};
 use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
@@ -32,12 +32,9 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
-    let models = vec![
-        json!({"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "deepseek"}),
-        json!({"id": "big-pickle", "object": "model", "owned_by": "opencode"}),
-        json!({"id": "mimo-v2.5-free", "object": "model", "owned_by": "xiaomi"}),
-        json!({"id": "nemotron-3-super-free", "object": "model", "owned_by": "nvidia"}),
-        json!({"id": "minimax-m3-free", "object": "model", "owned_by": "minimax"}),
-    ];
+    let models: Vec<_> = DEFAULT_MODELS
+        .iter()
+        .map(|(id, owner)| json!({"id": id, "object": "model", "owned_by": owner}))
+        .collect();
     Json(json!({ "object": "list", "data": models }))
 }
