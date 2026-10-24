@@ -478,8 +478,10 @@ pub struct UsageModelRow {
 mod tests {
     use super::*;
 
-    fn test_db() -> (Db, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("zen-test-{}.db", std::process::id()));
+    /// 每个测试用独立路径：cargo test 并行跑，共用路径会互相删库（WAL/SHM 冲突）。
+    fn test_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("zen-test-{}-{}.db", std::process::id(), tag));
         let _ = std::fs::remove_file(&path);
         (Db::open(path.to_str().unwrap()), path)
     }
@@ -533,7 +535,7 @@ mod tests {
 
     #[test]
     fn proxy_roundtrip_and_outcomes() {
-        let (db, path) = test_db();
+        let (db, path) = test_db("roundtrip");
         assert!(db.enabled());
 
         db.upsert_proxy("http://1.2.3.4:8080", 0.5, "fetch");
@@ -576,7 +578,7 @@ mod tests {
 
     #[test]
     fn request_log_and_usage_aggregation() {
-        let (db, path) = test_db();
+        let (db, path) = test_db("usage");
         let now = now_secs();
         // 对齐到当天 00:01 之后，保证 4 条记录落在同一个自然日（UTC）
         let base = (now / 86400) * 86400 + 60;
