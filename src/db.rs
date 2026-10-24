@@ -200,21 +200,36 @@ impl Db {
             return;
         }
         let now = now_secs();
-        let sql = match kind {
-            "success" => "UPDATE proxies SET success_count = success_count + 1,
-                          last_used = ?2, last_success = ?2, cooldown_until = 0 WHERE url = ?1",
-            "fail" => "UPDATE proxies SET fail_count = fail_count + 1, last_used = ?2,
-                       cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
-            "rate_limit" => "UPDATE proxies SET last_used = ?2,
-                             cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
-            "ban" => "UPDATE proxies SET ban_count = ban_count + 1, last_used = ?2,
-                      cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
-            _ => "UPDATE proxies SET last_used = ?2 WHERE url = ?1",
+        let cooldown = cooldown_until_unix.unwrap_or(0);
+        // 注意：rusqlite 要求参数个数与占位符严格相等（多传报 InvalidParameterCount），
+        // 因此按分支分别绑定，不能共用一份参数。
+        let result = match kind {
+            "success" => self.conn.lock().unwrap().execute(
+                "UPDATE proxies SET success_count = success_count + 1,
+                 last_used = ?2, last_success = ?2, cooldown_until = 0 WHERE url = ?1",
+                params![url, now],
+            ),
+            "fail" => self.conn.lock().unwrap().execute(
+                "UPDATE proxies SET fail_count = fail_count + 1, last_used = ?2,
+                 cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
+                params![url, now, cooldown],
+            ),
+            "rate_limit" => self.conn.lock().unwrap().execute(
+                "UPDATE proxies SET last_used = ?2,
+                 cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
+                params![url, now, cooldown],
+            ),
+            "ban" => self.conn.lock().unwrap().execute(
+                "UPDATE proxies SET ban_count = ban_count + 1, last_used = ?2,
+                 cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
+                params![url, now, cooldown],
+            ),
+            _ => self.conn.lock().unwrap().execute(
+                "UPDATE proxies SET last_used = ?2 WHERE url = ?1",
+                params![url, now],
+            ),
         };
-        if let Err(e) = self.conn.lock().unwrap().execute(
-            sql,
-            params![url, now, cooldown_until_unix.unwrap_or(0)],
-        ) {
+        if let Err(e) = result {
             warn!("db record_outcome({}) failed: {}", kind, e);
         }
     }
