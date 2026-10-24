@@ -56,6 +56,7 @@ pub struct RequestMetric {
 }
 
 /// 单条请求的元数据，随 TrackerState 传递，落库时作为 requests 表的列。
+#[derive(Clone)]
 pub struct TrackerMeta {
     /// 客户端请求的模型名。
     pub model: String,

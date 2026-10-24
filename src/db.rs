@@ -588,7 +588,7 @@ mod tests {
                 model: "model-a".into(),
                 model_used: "model-b".into(),
                 status: if i == 3 { 502 } else { 200 },
-                latency_ms: 100 + i,
+                latency_ms: 100 + i as u64,
                 ttft_ms: 10,
                 is_stream: i % 2 == 0,
                 proxy_url: Some("http://1.2.3.4:8080".into()),
