@@ -221,12 +221,7 @@ impl Db {
                  cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
                 params![url, now, cooldown],
             ),
-            "rate_limit" => self.conn.lock().unwrap().execute(
-                "UPDATE proxies SET last_used = ?2,
-                 cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
-                params![url, now, cooldown],
-            ),
-            "manual_ban" => self.conn.lock().unwrap().execute(
+            "rate_limit" | "manual_ban" => self.conn.lock().unwrap().execute(
                 "UPDATE proxies SET last_used = ?2,
                  cooldown_until = MAX(cooldown_until, ?3) WHERE url = ?1",
                 params![url, now, cooldown],
@@ -474,7 +469,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT proxy_url, COUNT(*), SUM(status BETWEEN 200 AND 399),
-                    SUM(COALESCE(NULLIF(total_tokens,0),0)),
+                    SUM(total_tokens),
                     CAST(AVG(latency_ms) AS INTEGER),
                     CAST(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS INTEGER)
              FROM requests
@@ -511,9 +506,9 @@ impl Db {
         self.usage_agg(
             "SELECT ts/86400, COUNT(*),
                     SUM(status BETWEEN 200 AND 399),
-                    SUM(COALESCE(NULLIF(prompt_tokens,0),0)),
-                    SUM(COALESCE(NULLIF(completion_tokens,0),0)),
-                    SUM(COALESCE(NULLIF(total_tokens,0),0))
+                    SUM(prompt_tokens),
+                    SUM(completion_tokens),
+                    SUM(total_tokens)
              FROM requests WHERE ts >= ?1 GROUP BY ts/86400 ORDER BY ts/86400",
             since_unix,
         )
@@ -527,9 +522,9 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT model, COUNT(*), SUM(status BETWEEN 200 AND 399),
-                    SUM(COALESCE(NULLIF(total_tokens,0),0)),
-                    SUM(COALESCE(NULLIF(prompt_tokens,0),0)),
-                    SUM(COALESCE(NULLIF(completion_tokens,0),0)),
+                    SUM(total_tokens),
+                    SUM(prompt_tokens),
+                    SUM(completion_tokens),
                     CAST(AVG(latency_ms) AS INTEGER),
                     CAST(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS INTEGER)
              FROM requests WHERE ts >= ?1 GROUP BY model ORDER BY COUNT(*) DESC",

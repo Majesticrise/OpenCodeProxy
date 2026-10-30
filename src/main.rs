@@ -244,6 +244,10 @@ fn cleanup_old_logs(dir: &str, keep_days: i64) {
         if !meta.is_file() {
             continue;
         }
+        // 只清理本程序的滚动日志（zen.log.YYYY-MM-DD），目录里用户自己的文件不动
+        if !entry.file_name().to_string_lossy().starts_with("zen.log") {
+            continue;
+        }
         let Ok(modified) = meta.modified() else {
             continue;
         };

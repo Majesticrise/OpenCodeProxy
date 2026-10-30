@@ -615,7 +615,12 @@ pub async fn chat_completions(
                     if let Some(ref p) = proxy {
                         state.pool.report_rate_limit(p).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    // 免费层限流是分钟级 RPM / 日级配额（实测连续成功后稳定 429），
+                    // 毫秒级退避毫无意义，至少秒级递增：2s, 4s, ..., 最高 16s。
+                    tokio::time::sleep(Duration::from_secs(
+                        (2 * (attempt as u64 + 1)).min(16),
+                    ))
+                    .await;
                     continue;
                 }
 
